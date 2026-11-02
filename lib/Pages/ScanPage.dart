@@ -1,5 +1,6 @@
 // lib/scan_page.dart
 import 'dart:async';
+import 'dart:io' show Platform;
 import 'dart:math' as math;
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
@@ -7,6 +8,7 @@ import 'package:flutter/services.dart';
 import 'package:hugeicons/hugeicons.dart';
 import 'package:mobile_scanner/mobile_scanner.dart';
 import '../Auth/AuthService.dart';
+import '../Services/BiometrricService.dart';
 import '../Services/DataService.dart';
 import '../Services/ScanService.dart';
 import 'FingrPrintPage.dart';
@@ -65,10 +67,19 @@ class _Hi extends StatelessWidget {
   Widget build(BuildContext context) => HugeIcon(icon: icon, color: color, size: size);
 }
 
+const Set<String> _bioCodes = {
+  'NO_BIOMETRIC_ENROLLED',
+  'BIOMETRIC_REQUIRED',
+  'BIOMETRIC_CHANGED',
+  'BIOMETRIC_FAILED',
+  'CHALLENGE_EXPIRED',
+  'ENROLL_NOT_ALLOWED',
+};
+
 // ════════════════════════════════════════════════════════════════════
 //  SCAN PAGE
 // ════════════════════════════════════════════════════════════════════
-enum _Phase { checking, blocked, camera, submitting, result }
+enum _Phase { checking, biometric, blocked, camera, submitting, result }
 
 class ScanPage extends StatefulWidget {
   const ScanPage({super.key});
@@ -79,7 +90,7 @@ class ScanPage extends StatefulWidget {
 
 class _ScanPageState extends State<ScanPage>
     with WidgetsBindingObserver, SingleTickerProviderStateMixin {
-  // The fingerprint prompt now runs inside preflight(), so allow more time.
+  // The biometric prompt runs inside preflight(), so allow more time.
   static const Duration _submitTimeout = Duration(seconds: 90);
   static const Duration _requestTimeout = Duration(seconds: 20);
 
@@ -107,6 +118,10 @@ class _ScanPageState extends State<ScanPage>
   bool _approvalSent = false;
   String? _approvalError;
 
+  /// 'fingerprint' | 'face', detected by the OS.
+  String get _bioKind => _service.lastBioType ?? 'fingerprint';
+  IconData get _bioIcon => _bioKind == 'face' ? Icons.face_rounded : Icons.fingerprint;
+
   @override
   void initState() {
     super.initState();
@@ -124,11 +139,13 @@ class _ScanPageState extends State<ScanPage>
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    // Came back from system settings → re-check automatically.
-    if (state == AppLifecycleState.resumed && _openedSettings && _phase == _Phase.blocked) {
-      _openedSettings = false;
-      _runPreflight();
-      return;
+    // Back from system settings (location, or biometric set-up) → re-check automatically.
+    if (state == AppLifecycleState.resumed && _phase == _Phase.blocked) {
+      if (_openedSettings || _failure?.code == 'NO_BIOMETRIC_ENROLLED') {
+        _openedSettings = false;
+        _runPreflight();
+        return;
+      }
     }
 
     final s = _scanner;
@@ -191,7 +208,10 @@ class _ScanPageState extends State<ScanPage>
       _approvalError = null;
     });
     try {
-      final ctx = await _service.preflight().timeout(_submitTimeout);
+      final ctx = await _service.preflight(onBiometric: (_) {
+        if (!mounted || id != _seq) return;
+        setState(() => _phase = _Phase.biometric);
+      }).timeout(_submitTimeout);
       if (!mounted || id != _seq) return;
       if (ctx.next == CheckinAction.done) {
         setState(() {
@@ -225,7 +245,6 @@ class _ScanPageState extends State<ScanPage>
   }
 
   /// "Phone not approved" → send a request to HR.
-  /// 'approved' from the server means HR already did it, so just re-check.
   Future<void> _requestApproval() async {
     if (_approvalBusy) return;
     setState(() {
@@ -267,8 +286,7 @@ class _ScanPageState extends State<ScanPage>
     });
   }
 
-  /// Back to the camera without redoing the location check
-  /// (used after a bad / expired / wrong-branch QR).
+  /// Back to the camera without redoing the location check.
   void _rescan() {
     _disposeScannerLater();
     setState(() {
@@ -302,7 +320,6 @@ class _ScanPageState extends State<ScanPage>
     HapticFeedback.selectionClick();
     setState(() => _phase = _Phase.submitting);
     try {
-      // fresh location + Wi-Fi at the moment of scanning
       final res = await (() async {
         final facts = await _service.collectFacts();
         return _service.submit(payload, facts);
@@ -345,6 +362,24 @@ class _ScanPageState extends State<ScanPage>
     }
   }
 
+  /// Long-press the title: prints BSSID, GPS and biometric type (for the real-iPhone test).
+  Future<void> _showDiagnostics() async {
+    final data = await _service.diagnostics();
+    if (!mounted) return;
+    await showDialog<void>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: const Text('Diagnostics'),
+        content: SingleChildScrollView(
+          child: SelectableText(data.entries.map((e) => '${e.key}: ${e.value}').join('\n\n')),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.of(dialogContext).pop(), child: const Text('Close')),
+        ],
+      ),
+    );
+  }
+
   // ───────────── error presentation ─────────────
   static String _fmt(int m) {
     final h24 = (m ~/ 60) % 24;
@@ -353,7 +388,6 @@ class _ScanPageState extends State<ScanPage>
     return '$h12:${mm.toString().padLeft(2, '0')} ${h24 >= 12 ? 'PM' : 'AM'}';
   }
 
-  /// "Shift 2 of 3" for staff with several shifts, empty for single-shift staff.
   static String _shiftTitle(int? number, int total) =>
       (total > 1 && number != null) ? 'Shift $number of $total' : '';
 
@@ -394,14 +428,15 @@ class _ScanPageState extends State<ScanPage>
       case 'NETWORK':
         return 'No connection';
       case 'NO_BIOMETRIC_ENROLLED':
+        return 'Set up fingerprint or Face ID';
       case 'BIOMETRIC_REQUIRED':
-        return 'Register your fingerprint';
+        return BioText.registerTitle(_bioKind);
       case 'BIOMETRIC_CHANGED':
-        return 'Fingerprint changed';
+        return 'Biometric changed';
       case 'BIOMETRIC_FAILED':
-        return 'Fingerprint not confirmed';
+        return 'Not confirmed';
       case 'CHALLENGE_EXPIRED':
-        return 'Confirm your fingerprint again';
+        return 'Confirm again';
       case 'ENROLL_NOT_ALLOWED':
         return 'Already registered';
       default:
@@ -449,19 +484,21 @@ class _ScanPageState extends State<ScanPage>
       case 'ALREADY_CHECKED_OUT':
         return _C.blue;
       default:
-      // DEVICE_NOT_APPROVED lands here: orange because the user can act on it.
         return _C.orange;
     }
   }
 
   List<String> _tips(String code) {
+    final bio = BioText.name(_bioKind);
     switch (code) {
       case 'LOCATION_OFF':
         return const ['Turn on Location (GPS) on your phone', 'Come back here, we will check again automatically'];
       case 'LOCATION_DENIED':
         return const ['Allow location access when asked', 'We only use it to confirm you are at the branch'];
       case 'LOCATION_DENIED_FOREVER':
-        return const ['Open app settings', 'Set Location to "Allow" for this app'];
+        return Platform.isIOS
+            ? const ['Open app settings → Location', 'Choose "While Using the App" and turn Precise Location on']
+            : const ['Open app settings', 'Set Location to "Allow" for this app'];
       case 'NO_FIX':
       case 'LOW_ACCURACY':
         return const ['Move closer to a window or step outside', 'Wait a few seconds for the GPS to lock'];
@@ -470,7 +507,13 @@ class _ScanPageState extends State<ScanPage>
       case 'OUT_OF_RANGE':
         return const ['Go to your branch and try again'];
       case 'WIFI_NOT_ALLOWED':
-        return const ['Connect your phone to the office Wi-Fi', 'Turn off mobile data if it still fails'];
+        return Platform.isIOS
+            ? const [
+          'Connect your iPhone to the office Wi-Fi',
+          'Settings → Xaadir → Location: "While Using" and Precise Location ON',
+          'Long-press this title to see what the phone reads',
+        ]
+            : const ['Connect your phone to the office Wi-Fi', 'Turn off mobile data if it still fails'];
       case 'IP_NOT_ALLOWED':
         return const ['Turn off VPN or mobile data', 'Use the office Wi-Fi network'];
       case 'DEVICE_NOT_APPROVED':
@@ -488,16 +531,21 @@ class _ScanPageState extends State<ScanPage>
       case 'NETWORK':
         return const ['Check your Wi-Fi or mobile data', 'Then try again'];
       case 'NO_BIOMETRIC_ENROLLED':
+        return const [
+          'Android: Settings → Security → Fingerprint',
+          'iPhone: Settings → Face ID & Passcode (or Touch ID & Passcode)',
+          'Come back here, we will check again automatically',
+        ];
       case 'BIOMETRIC_REQUIRED':
-        return const ['Register your fingerprint once on this phone', 'Check-in is locked to your finger'];
+        return ['Register $bio once on this phone', 'Check-in is locked to you: no PIN or pattern'];
       case 'BIOMETRIC_CHANGED':
         return const [
-          'A fingerprint was added or removed on this phone',
-          'Ask HR to approve re-enrollment, then register again at the office'
+          'A fingerprint or face was added or removed on this phone',
+          'Ask HR to approve re-enrollment, then register again at the office',
         ];
       case 'BIOMETRIC_FAILED':
       case 'CHALLENGE_EXPIRED':
-        return const ['Touch the sensor with your registered finger', 'Only a fingerprint works: no PIN or pattern'];
+        return ['Use $bio again', 'Only your fingerprint or face works: no PIN or pattern'];
       default:
         return const [];
     }
@@ -536,6 +584,17 @@ class _ScanPageState extends State<ScanPage>
           title: 'Checking your location',
           subtitle: 'Confirming you are at the branch and on the office Wi-Fi.',
           onClose: _close,
+          onTitleLongPress: _showDiagnostics,
+        );
+
+      case _Phase.biometric:
+        return _StatusView(
+          tone: _C.ink,
+          leading: Icon(_bioIcon, size: 46, color: _C.ink),
+          title: BioText.scanTitle(_bioKind),
+          subtitle: 'Confirm it is you to continue. Only your own fingerprint or face works: no PIN or pattern.',
+          onClose: _close,
+          onTitleLongPress: _showDiagnostics,
         );
 
       case _Phase.blocked:
@@ -558,7 +617,9 @@ class _ScanPageState extends State<ScanPage>
     final sent = notApproved && _approvalSent;
 
     Color tone = _blockedTone(code);
-    Widget leading = _Hi(_blockedIcon(code), size: 40, color: tone);
+    Widget leading = _bioCodes.contains(code)
+        ? Icon(_bioIcon, size: 42, color: tone)
+        : _Hi(_blockedIcon(code), size: 40, color: tone);
     String title = _blockedTitle(code);
     String subtitle = f.message;
     List<String> tips = _tips(code);
@@ -589,7 +650,6 @@ class _ScanPageState extends State<ScanPage>
         break;
       case 'DEVICE_NOT_APPROVED':
         if (sent) {
-          // request is with HR now
           tone = _C.green;
           leading = const _PopIn(child: Icon(Icons.check_rounded, color: _C.green, size: 46));
           title = 'Request sent';
@@ -624,8 +684,14 @@ class _ScanPageState extends State<ScanPage>
         primary = () => _close();
         break;
       case 'NO_BIOMETRIC_ENROLLED':
+      // Phone has no strong biometric: scanning stays blocked until it is set up.
+        primaryLabel = 'Try again';
+        primary = _runPreflight;
+        secondaryLabel = 'Done';
+        secondary = () => _close();
+        break;
       case 'BIOMETRIC_REQUIRED':
-        primaryLabel = 'Register fingerprint';
+        primaryLabel = BioText.registerTitle(_bioKind);
         primary = () async {
           final ok = await Navigator.of(context).push<bool>(
             MaterialPageRoute<bool>(builder: (_) => const EnrollFingerprintPage()),
@@ -654,6 +720,7 @@ class _ScanPageState extends State<ScanPage>
       secondaryLabel: secondaryLabel,
       onSecondary: secondary,
       onClose: _close,
+      onTitleLongPress: _showDiagnostics,
     );
   }
 
@@ -661,7 +728,6 @@ class _ScanPageState extends State<ScanPage>
   Widget _buildResult() {
     final r = _result;
     if (r == null) {
-      // preflight said every scan of the day was already recorded
       final multi = (_ctx?.shiftTotal ?? 1) > 1;
       return _StatusView(
         tone: _C.green,
@@ -805,7 +871,6 @@ class _ScanPageState extends State<ScanPage>
                   ),
                 ),
 
-              // dark overlay with rounded hole
               IgnorePointer(
                 child: CustomPaint(
                   size: Size(w, h),
@@ -813,7 +878,6 @@ class _ScanPageState extends State<ScanPage>
                 ),
               ),
 
-              // frame border
               Positioned.fromRect(
                 rect: frame,
                 child: IgnorePointer(
@@ -831,7 +895,6 @@ class _ScanPageState extends State<ScanPage>
               ),
               ..._corners(frame, submitting),
 
-              // scan line
               if (!submitting)
                 Positioned.fromRect(
                   rect: frame,
@@ -864,7 +927,6 @@ class _ScanPageState extends State<ScanPage>
                   ),
                 ),
 
-              // submitting spinner
               if (submitting)
                 Positioned.fromRect(
                   rect: frame,
@@ -889,7 +951,6 @@ class _ScanPageState extends State<ScanPage>
                   ),
                 ),
 
-              // bottom status pill (only when there is something to say)
               Positioned(
                 left: 24,
                 right: 24,
@@ -918,7 +979,7 @@ class _ScanPageState extends State<ScanPage>
                 ),
               ),
 
-              // TOP BAR — last in the stack so it always receives touches
+              // TOP BAR: last in the stack so it always receives touches
               Positioned(
                 top: 0,
                 left: 0,
@@ -936,16 +997,20 @@ class _ScanPageState extends State<ScanPage>
                           onTap: () => _close(),
                         ),
                         Expanded(
-                          child: Text(
-                            barTitle,
-                            textAlign: TextAlign.center,
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: const TextStyle(
-                              fontFamily: _T.f,
-                              fontSize: 17,
-                              fontWeight: FontWeight.w600,
-                              color: Colors.white,
+                          child: GestureDetector(
+                            behavior: HitTestBehavior.opaque,
+                            onLongPress: submitting ? null : _showDiagnostics,
+                            child: Text(
+                              barTitle,
+                              textAlign: TextAlign.center,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(
+                                fontFamily: _T.f,
+                                fontSize: 17,
+                                fontWeight: FontWeight.w600,
+                                color: Colors.white,
+                              ),
                             ),
                           ),
                         ),
@@ -1059,8 +1124,7 @@ class _ScanPageState extends State<ScanPage>
 }
 
 // ════════════════════════════════════════════════════════════════════
-//  STATUS VIEW (checking / blocked / result / camera error)
-//  Close button on top, content centered, actions anchored at bottom.
+//  STATUS VIEW (checking / biometric / blocked / result / camera error)
 // ════════════════════════════════════════════════════════════════════
 class _StatusView extends StatelessWidget {
   const _StatusView({
@@ -1075,6 +1139,7 @@ class _StatusView extends StatelessWidget {
     this.onPrimary,
     this.secondaryLabel,
     this.onSecondary,
+    this.onTitleLongPress,
   });
 
   final Color tone;
@@ -1088,6 +1153,7 @@ class _StatusView extends StatelessWidget {
   final VoidCallback? onPrimary;
   final String? secondaryLabel;
   final VoidCallback? onSecondary;
+  final VoidCallback? onTitleLongPress;
 
   @override
   Widget build(BuildContext context) {
@@ -1138,7 +1204,11 @@ class _StatusView extends StatelessWidget {
                           ),
                         ),
                         const SizedBox(height: 24),
-                        Text(title, textAlign: TextAlign.center, style: _T.title),
+                        GestureDetector(
+                          behavior: HitTestBehavior.opaque,
+                          onLongPress: onTitleLongPress,
+                          child: Text(title, textAlign: TextAlign.center, style: _T.title),
+                        ),
                         const SizedBox(height: 8),
                         Text(subtitle, textAlign: TextAlign.center, style: _T.body),
                         if (body != null) ...[
@@ -1321,7 +1391,7 @@ class _OverlayPainter extends CustomPainter {
 }
 
 // ════════════════════════════════════════════════════════════════════
-//  Round icon button (close / torch) — 52px touch target
+//  Round icon button (close / torch): 52px touch target
 // ════════════════════════════════════════════════════════════════════
 class _RoundButton extends StatelessWidget {
   const _RoundButton({

@@ -1,4 +1,7 @@
-// lib/Services/BiometricService.dart
+// lib/Services/BiometrricService.dart
+import 'dart:io' show Platform;
+import 'dart:ui' show PlatformDispatcher;
+
 import 'package:flutter/services.dart';
 
 import '../Auth/AuthService.dart';
@@ -13,15 +16,55 @@ class BioStatus {
     required this.reason,
     required this.keyExists,
     required this.keyValid,
+    this.type = 'none',
   });
 
-  final bool available; // a strong fingerprint is enrolled on the phone
-  final String reason; // OK | NO_HARDWARE | NONE_ENROLLED | HW_UNAVAILABLE | UPDATE_REQUIRED | UNSUPPORTED
+  /// A strong biometric is enrolled on the phone (Android BIOMETRIC_STRONG, iOS Face ID / Touch ID).
+  final bool available;
+
+  /// OK | NO_HARDWARE | NONE_ENROLLED | HW_UNAVAILABLE | UPDATE_REQUIRED | UNSUPPORTED
+  final String reason;
   final bool keyExists;
   final bool keyValid;
+
+  /// 'fingerprint' | 'face' | 'none'  (detected by the OS, never guessed from the model)
+  final String type;
+
+  bool get isFace => type == 'face';
 }
 
-/// Proof that the enrolled finger just signed a fresh server challenge.
+/// All user-facing biometric text (English + Somali) in one place.
+class BioText {
+  BioText._();
+
+  static bool get _so => PlatformDispatcher.instance.locale.languageCode.toLowerCase() == 'so';
+
+  static String get setupRequired => _so
+      ? 'Ku dhis faraha (Android) ama Face ID / Touch ID (iPhone) dejinta taleefankaaga, kadibna mar kale isku day.'
+      : 'Set up a fingerprint (Android) or Face ID / Touch ID (iPhone) in your phone settings, then try again.';
+
+  /// Short name: "Face ID", "Touch ID", "Fingerprint", "Face unlock".
+  static String name(String type) {
+    if (type == 'face') return Platform.isIOS ? 'Face ID' : 'Face unlock';
+    return Platform.isIOS ? 'Touch ID' : 'Fingerprint';
+  }
+
+  static String scanTitle(String type) {
+    if (type == 'face') {
+      final n = Platform.isIOS ? 'Face ID' : 'Face unlock';
+      return _so ? 'Fiiri taleefankaaga ($n)' : 'Look at your phone ($n)';
+    }
+    if (Platform.isIOS) {
+      return _so ? 'Faraha ku dheji sensor-ka (Touch ID)' : 'Scan your fingerprint (Touch ID)';
+    }
+    return _so ? 'Faraha ku dheji sensor-ka' : 'Scan your fingerprint';
+  }
+
+  static String registerTitle(String type) =>
+      _so ? 'Diiwaangeli ${name(type)}' : 'Register ${name(type)}';
+}
+
+/// Proof that the enrolled biometric just signed a fresh server challenge.
 class BioProof {
   BioProof({required this.challengeId, required this.signature}) : at = DateTime.now();
 
@@ -38,8 +81,8 @@ class _Challenge {
   final String value;
 }
 
-/// Fingerprint-bound key (Android Keystore, via the Kotlin channel).
-/// Only the fingerprint can unlock it: no PIN, pattern or password fallback.
+/// Biometric-bound key. Android: Keystore (Kotlin). iOS: Secure Enclave (Swift).
+/// Only the phone's own enrolled biometric unlocks it: no PIN, pattern or password fallback.
 class BiometricService {
   BiometricService._();
   static final BiometricService instance = BiometricService._();
@@ -52,11 +95,15 @@ class BiometricService {
   Future<BioStatus> localStatus() async {
     try {
       final m = await _ch.invokeMapMethod<String, dynamic>('status');
+      final available = m?['available'] == true;
+      var type = m?['type']?.toString() ?? 'none';
+      if (type != 'face' && type != 'fingerprint') type = available ? 'fingerprint' : 'none';
       return BioStatus(
-        available: m?['available'] == true,
+        available: available,
         reason: m?['reason']?.toString() ?? 'UNSUPPORTED',
         keyExists: m?['keyExists'] == true,
         keyValid: m?['keyValid'] == true,
+        type: type,
       );
     } on MissingPluginException {
       return const BioStatus(available: false, reason: 'UNSUPPORTED', keyExists: false, keyValid: false);
@@ -75,7 +122,7 @@ class BiometricService {
     return j['biometric_status']?.toString() ?? 'none';
   }
 
-  /// One answer for the UI: can this staff member check in with a fingerprint right now?
+  /// One answer for the UI: can this staff member check in right now?
   Future<BioGate> gate() async {
     final local = await localStatus();
     final server = await serverStatus();
@@ -87,17 +134,17 @@ class BiometricService {
   }
 
   // ───────────── enrollment ─────────────
-  /// Creates the key pair behind a fingerprint prompt and registers the public key.
+  /// Creates the key pair, proves possession behind the biometric prompt, registers the public key.
   Future<void> enroll() async {
     final local = await localStatus();
-    if (!local.available) throw _noBiometric(local.reason);
+    if (!local.available) throw _noBiometric();
 
     final server = await serverStatus();
     if (server == 'invalidated') throw _changed();
     if (server == 'active') {
       throw AuthFailure(
         'ENROLL_NOT_ALLOWED',
-        'A fingerprint is already registered on this phone. Ask HR to approve re-enrollment.',
+        'A biometric is already registered on this phone. Ask HR to approve re-enrollment.',
       );
     }
 
@@ -116,7 +163,7 @@ class BiometricService {
     try {
       final signature = await _sign(
         'xaadir:enroll:${ch.id}:${ch.value}:$deviceId',
-        'Register your fingerprint',
+        'Confirm to register',
       );
       await _auth.callFunction('enroll-biometric', {
         'action': 'enroll',
@@ -125,6 +172,7 @@ class BiometricService {
         'challenge_id': ch.id,
         'public_key': publicKey,
         'signature': signature,
+        'biometric_type': local.type == 'face' ? 'face' : 'fingerprint',
       });
     } catch (_) {
       await _deleteKeySilently(); // keep phone and server in step
@@ -133,14 +181,13 @@ class BiometricService {
   }
 
   // ───────────── check-in proof ─────────────
-  /// Shows the fingerprint prompt and signs a fresh server challenge.
   Future<BioProof> proveIdentity({String subtitle = 'Confirm to continue'}) async {
     final local = await localStatus();
-    if (!local.available) throw _noBiometric(local.reason);
-    if (!local.keyExists) {
-      throw AuthFailure('NO_BIOMETRIC_ENROLLED', 'Register your fingerprint to check in.');
-    }
-    if (!local.keyValid) {
+    if (!local.available) throw _noBiometric();
+
+    // The server already accepted this phone as "active" before we got here,
+    // so a missing / dead key means the enrolled biometrics changed (or the app was reinstalled).
+    if (!local.keyExists || !local.keyValid) {
       await _reportInvalidated();
       throw _changed();
     }
@@ -170,7 +217,7 @@ class BiometricService {
         'subtitle': subtitle,
       });
       if (s == null || s.isEmpty) {
-        throw AuthFailure('BIOMETRIC_FAILED', 'Fingerprint was not confirmed.');
+        throw AuthFailure('BIOMETRIC_FAILED', 'Could not confirm it is you. Try again.');
       }
       return s;
     } on PlatformException catch (e) {
@@ -179,19 +226,24 @@ class BiometricService {
           await _reportInvalidated();
           throw _changed();
         case 'NO_KEY':
-          throw AuthFailure('NO_BIOMETRIC_ENROLLED', 'Register your fingerprint to check in.');
+          throw AuthFailure('BIOMETRIC_REQUIRED', 'Register your biometric to check in.');
+        case 'NONE_ENROLLED':
+          throw _noBiometric();
         case 'CANCELLED':
-          throw AuthFailure('BIOMETRIC_FAILED', 'Fingerprint check was cancelled.');
+          throw AuthFailure('BIOMETRIC_FAILED', 'The check was cancelled.');
         case 'LOCKED_OUT':
-          throw AuthFailure('BIOMETRIC_FAILED', 'Too many wrong attempts. Wait 30 seconds and try again.');
+          throw AuthFailure(
+            'BIOMETRIC_FAILED',
+            'Too many wrong attempts. Wait a moment (or unlock your phone once), then try again.',
+          );
         default:
-          throw AuthFailure('BIOMETRIC_FAILED', 'Fingerprint was not recognised. Try again.');
+          throw AuthFailure('BIOMETRIC_FAILED', 'Could not confirm it is you. Try again.');
       }
     }
   }
 
-  /// Tells the server the key is dead (new fingerprint added). The function always answers
-  /// BIOMETRIC_CHANGED, so the error is expected and ignored here.
+  /// Tells the server the key is dead. The function always answers BIOMETRIC_CHANGED,
+  /// so the error is expected and ignored here.
   Future<void> _reportInvalidated() async {
     try {
       await _auth.callFunction('enroll-biometric', {
@@ -209,17 +261,8 @@ class BiometricService {
 
   AuthFailure _changed() => AuthFailure(
     'BIOMETRIC_CHANGED',
-    'Your fingerprints changed on this phone. Ask HR to approve re-enrollment.',
+    'The fingerprint or face on this phone changed. Ask HR to approve re-enrollment.',
   );
 
-  AuthFailure _noBiometric(String reason) {
-    switch (reason) {
-      case 'NO_HARDWARE':
-        return AuthFailure('NO_BIOMETRIC_ENROLLED', 'This phone has no fingerprint sensor, so it cannot be used to check in.');
-      case 'NONE_ENROLLED':
-        return AuthFailure('NO_BIOMETRIC_ENROLLED', 'Add a fingerprint in your phone settings (Security → Fingerprint), then try again.');
-      default:
-        return AuthFailure('NO_BIOMETRIC_ENROLLED', 'Fingerprint is not available right now. Try again in a moment.');
-    }
-  }
+  AuthFailure _noBiometric() => AuthFailure('NO_BIOMETRIC_ENROLLED', BioText.setupRequired);
 }

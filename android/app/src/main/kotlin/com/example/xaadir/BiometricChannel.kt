@@ -1,5 +1,6 @@
 package com.example.xaadir // <- change to your applicationId / package
 
+import android.content.pm.PackageManager
 import android.os.Build
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyPermanentlyInvalidatedException
@@ -20,10 +21,10 @@ import java.security.Signature
 import java.security.spec.ECGenParameterSpec
 
 /**
- * Fingerprint-bound signing key (Android Keystore, EC P-256).
- *  - fingerprint ONLY (BIOMETRIC_STRONG, no PIN / pattern / password fallback)
- *  - user authentication required for EVERY signature
- *  - key is permanently invalidated when a fingerprint is added (or all are removed)
+ * Biometric-bound signing key (Android Keystore, EC P-256).
+ *  - BIOMETRIC_STRONG only (weak camera-only face unlock is rejected by the OS class)
+ *  - user authentication required for EVERY signature, no PIN / pattern / password fallback
+ *  - key is permanently invalidated when a biometric is added (or all are removed)
  */
 class BiometricChannel(
     private val activity: FragmentActivity,
@@ -61,6 +62,17 @@ class BiometricChannel(
     }
 
     // ───────────── status ─────────────
+    /** 'fingerprint' | 'face' | 'none', from the system feature flags (not the phone model). */
+    private fun biometricType(): String {
+        val pm = activity.packageManager
+        return when {
+            pm.hasSystemFeature(PackageManager.FEATURE_FINGERPRINT) -> "fingerprint"
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q &&
+                    pm.hasSystemFeature(PackageManager.FEATURE_FACE) -> "face"
+            else -> "none"
+        }
+    }
+
     private fun status(): Map<String, Any> {
         val code = BiometricManager.from(activity).canAuthenticate(BIOMETRIC_STRONG)
         val reason = when (code) {
@@ -71,10 +83,14 @@ class BiometricChannel(
             BiometricManager.BIOMETRIC_ERROR_SECURITY_UPDATE_REQUIRED -> "UPDATE_REQUIRED"
             else -> "UNSUPPORTED"
         }
+        val available = code == BiometricManager.BIOMETRIC_SUCCESS
+        var type = biometricType()
+        if (available && type == "none") type = "fingerprint" // strong biometric enrolled, class unknown
         val exists = loadPrivateKey() != null
         return mapOf(
-            "available" to (code == BiometricManager.BIOMETRIC_SUCCESS),
+            "available" to available,
             "reason" to reason,
+            "type" to type,
             "keyExists" to exists,
             "keyValid" to (exists && keyValid()),
         )
@@ -112,7 +128,7 @@ class BiometricChannel(
             .setInvalidatedByBiometricEnrollment(true)
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            // timeout 0 = authenticate for every single use, fingerprint class only
+            // timeout 0 = authenticate for every single use, biometric class only
             builder.setUserAuthenticationParameters(0, KeyProperties.AUTH_BIOMETRIC_STRONG)
         } else {
             builder.setUserAuthenticationValidityDurationSeconds(-1) // every use
@@ -150,21 +166,21 @@ class BiometricChannel(
         }
     }
 
-    // ───────────── signing behind the fingerprint prompt ─────────────
+    // ───────────── signing behind the biometric prompt ─────────────
     private fun sign(payload: String?, title: String?, subtitle: String?, result: MethodChannel.Result) {
         if (payload.isNullOrEmpty()) {
             result.error("INVALID_PAYLOAD", "Nothing to sign", null)
             return
         }
         if (busy) {
-            result.error("BUSY", "A fingerprint prompt is already open", null)
+            result.error("BUSY", "A biometric prompt is already open", null)
             return
         }
 
         val signature = try {
             newSignature()
         } catch (e: KeyPermanentlyInvalidatedException) {
-            result.error("KEY_INVALIDATED", "Fingerprints changed", null)
+            result.error("KEY_INVALIDATED", "Biometrics changed", null)
             return
         } catch (e: IllegalStateException) {
             result.error("NO_KEY", "No key on this phone", null)
@@ -198,17 +214,18 @@ class BiometricChannel(
                     BiometricPrompt.ERROR_CANCELED -> "CANCELLED"
                     BiometricPrompt.ERROR_LOCKOUT,
                     BiometricPrompt.ERROR_LOCKOUT_PERMANENT -> "LOCKED_OUT"
+                    BiometricPrompt.ERROR_NO_BIOMETRICS -> "NONE_ENROLLED"
                     else -> "AUTH_ERROR"
                 }
                 result.error(code, errString.toString(), null)
             }
-            // onAuthenticationFailed: wrong finger, the prompt stays open for another try
+            // onAuthenticationFailed: wrong finger/face, the prompt stays open for another try
         })
 
         val info = BiometricPrompt.PromptInfo.Builder()
             .setTitle(title ?: "Confirm it's you")
             .setSubtitle(subtitle)
-            .setAllowedAuthenticators(BIOMETRIC_STRONG) // fingerprint only: no PIN / pattern / password
+            .setAllowedAuthenticators(BIOMETRIC_STRONG) // biometric only: no PIN / pattern / password
             .setNegativeButtonText("Cancel")
             .setConfirmationRequired(false)
             .build()

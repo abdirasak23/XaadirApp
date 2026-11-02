@@ -1,5 +1,6 @@
 // lib/Services/ScanService.dart
 import 'dart:async';
+import 'dart:io' show Platform;
 
 import 'package:flutter/foundation.dart';
 import 'package:location/location.dart' as gps;
@@ -26,12 +27,9 @@ class DeviceFacts {
   final double accuracyM;
   final bool isMocked;
 
-  /// BSSID of the access point the phone is connected to right now.
-  /// A phone is on exactly ONE access point, so this is a single value.
+  /// BSSID of the access point the phone is connected to right now (single value).
   /// The server matches it against ALL rows of the branch in `branch_wifi`.
   final String? wifiBssid;
-
-  /// Network name, for logging / optional server fallback only.
   final String? wifiSsid;
 
   Map<String, dynamic> toJson() => {
@@ -61,8 +59,6 @@ class ScanContextInfo {
   final String branchName;
   final int distanceM;
   final int radiusM;
-
-  /// Which shift the next scan belongs to (1-based). Null when everything is done.
   final int? shiftNumber;
   final int shiftTotal;
   final int? shiftStartMin;
@@ -107,8 +103,6 @@ class CheckinResult {
   final int shiftTotal;
   final int? shiftStartMin;
   final int? shiftEndMin;
-
-  /// Shifts fully completed today, counting the one this scan just closed.
   final int shiftsDone;
 
   bool get isMultiShift => shiftTotal > 1;
@@ -136,21 +130,19 @@ class ScanService {
   static final RegExp _liveToken = RegExp(r'^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$');
   static final RegExp _bssid = RegExp(r'^([0-9A-F]{2}:){5}[0-9A-F]{2}$');
 
-  /// The server challenge lives 60 s. If the fingerprint proof is older than this
-  /// when the QR is scanned, the finger is asked for again.
+  /// The server challenge lives 60 s. If the proof is older than this when the QR is
+  /// scanned, the biometric is asked for again.
   static const Duration _proofMaxAge = Duration(seconds: 40);
 
-  /// Wi-Fi BSSID read: Android sometimes returns null on the first call.
   static const int _wifiReadAttempts = 3;
   static const Duration _wifiRetryDelay = Duration(milliseconds: 400);
 
   BioProof? _proof;
 
-  // ───────────── Wi-Fi helpers ─────────────
+  /// 'fingerprint' | 'face' (set at the start of every preflight, read by the UI).
+  String? lastBioType;
 
-  /// Normalizes any BSSID format to `AA:BB:CC:DD:EE:FF`.
-  /// Handles lowercase, dashes and missing zero-padding (`a:b:c:d:e:f`).
-  /// Returns null for invalid or placeholder values.
+  // ───────────── Wi-Fi helpers ─────────────
   static String? normalizeBssid(String? raw) {
     if (raw == null) return null;
     final cleaned = raw.trim().toUpperCase().replaceAll('-', ':');
@@ -175,12 +167,27 @@ class ScanService {
     return s;
   }
 
-  /// Reads the connected access point (BSSID + SSID), retrying a few times
-  /// because the first read right after permission grant can be empty.
+  /// Reads the connected access point. On iOS a null/empty BSSID means: location off,
+  /// permission not "While Using", Precise Location off, or the Wi-Fi entitlement is missing.
   Future<_WifiInfo> _readWifi() async {
     final info = NetworkInfo();
     String? bssid;
     String? ssid;
+
+    // iOS only gives out SSID/BSSID when location is allowed "While Using".
+    // network_info_plus no longer handles this, so permission_handler does.
+    if (Platform.isIOS) {
+      try {
+        var st = await ph.Permission.locationWhenInUse.status;
+        debugPrint('📶📍 iOS location permission → $st');
+        if (st.isDenied) {
+          st = await ph.Permission.locationWhenInUse.request();
+          debugPrint('📶📍 iOS location permission after request → $st');
+        }
+      } catch (e) {
+        debugPrint('📶⚠️ iOS location authorization check failed: $e');
+      }
+    }
 
     for (int attempt = 1; attempt <= _wifiReadAttempts; attempt++) {
       try {
@@ -201,7 +208,7 @@ class ScanService {
   }
 
   // ───────────── device facts (location + Wi-Fi) ─────────────
-  static const double _goodEnough = 25; // m: stop waiting for a better fix
+  static const double _goodEnough = 25;
   final gps.Location _gps = gps.Location();
 
   Future<DeviceFacts> collectFacts() async {
@@ -226,8 +233,6 @@ class ScanService {
       throw AuthFailure('LOCATION_DENIED', 'Allow location access to check in.');
     }
 
-    // Wi-Fi needs location permission on Android, so start it now and let it
-    // run while the GPS is locking: no extra waiting.
     final wifiFuture = _readWifi();
 
     gps.LocationData? best;
@@ -312,11 +317,36 @@ class ScanService {
 
   Future<void> openAppSettings() => ph.openAppSettings();
 
+  // ───────────── diagnostics (long-press the title on the scan screen) ─────────────
+  /// Prints BSSID, GPS and biometric type: used for the real-iPhone test at the office.
+  Future<Map<String, String>> diagnostics() async {
+    final out = <String, String>{};
+    out['Platform'] = Platform.isIOS ? 'iOS' : 'Android';
+    try {
+      final bio = await BiometricService.instance.localStatus();
+      out['Biometric'] = '${bio.type} (${bio.reason})';
+      out['Strong biometric enrolled'] = '${bio.available}';
+      out['Key exists / valid'] = '${bio.keyExists} / ${bio.keyValid}';
+    } catch (e) {
+      out['Biometric'] = 'error: $e';
+    }
+    try {
+      final f = await collectFacts();
+      out['GPS'] = '${f.lat.toStringAsFixed(6)}, ${f.lng.toStringAsFixed(6)} (±${f.accuracyM.round()} m)';
+      out['BSSID'] = f.wifiBssid ?? 'null  → location off / not "While Using" / Precise off / entitlement missing';
+      out['SSID'] = f.wifiSsid ?? 'null';
+    } on AuthFailure catch (e) {
+      out['GPS'] = '${e.code}: ${e.message}';
+      final w = await _readWifi();
+      out['BSSID'] = w.bssid ?? 'null';
+      out['SSID'] = w.ssid ?? 'null';
+    } catch (e) {
+      out['GPS'] = 'error: $e';
+    }
+    return out;
+  }
+
   // ───────────── phone not approved: ask HR ─────────────
-  /// Sends an approval request for THIS phone to HR.
-  /// Returns the server status: 'pending' (request saved) or 'approved'
-  /// (HR already approved it, so the caller should simply re-run preflight).
-  /// No GPS / Wi-Fi / fingerprint is needed for this call.
   Future<String> requestDeviceApproval() async {
     debugPrint('📲 Requesting HR approval for this phone');
     final json = await AuthService.instance.callFunction('checkin', {
@@ -329,10 +359,19 @@ class ScanService {
     return status;
   }
 
-  // ───────────── before the camera: right place, then the right finger ─────────────
-  Future<ScanContextInfo> preflight() async {
+  // ───────────── before the camera: biometric available, right place, then the biometric ─────────────
+  /// [onBiometric] fires right before the biometric prompt so the UI can show
+  /// "Scan your fingerprint" or "Look at your phone (Face ID)".
+  Future<ScanContextInfo> preflight({void Function(String type)? onBiometric}) async {
     _proof = null;
     debugPrint('🚦 Preflight started');
+
+    // 0. No strong biometric on the phone → block immediately (no GPS, no network).
+    final bio = await BiometricService.instance.localStatus();
+    lastBioType = bio.type == 'face' ? 'face' : 'fingerprint';
+    if (!bio.available) {
+      throw AuthFailure('NO_BIOMETRIC_ENROLLED', BioText.setupRequired);
+    }
 
     final facts = await collectFacts();
     final json = await AuthService.instance.callFunction('checkin', {
@@ -365,19 +404,18 @@ class ScanService {
     debugPrint('🚦✅ Preflight OK → next=$next shift=${ctx.shiftNumber}/${ctx.shiftTotal} '
         'branch=${ctx.branchName} dist=${ctx.distanceM}m/${ctx.radiusM}m');
 
-    // Place is fine: now the fingerprint, BEFORE the camera opens.
+    // Place is fine: now the biometric, BEFORE the camera opens.
     if (next != CheckinAction.done) {
+      onBiometric?.call(lastBioType!);
       _proof = await BiometricService.instance.proveIdentity(
         subtitle: next == CheckinAction.checkOut ? 'Confirm to check out' : 'Confirm to check in',
       );
-      debugPrint('🔐✅ Fingerprint proof ready');
+      debugPrint('🔐✅ Biometric proof ready');
     }
     return ctx;
   }
 
   // ───────────── QR parsing ─────────────
-  /// Static: xaadir://checkin?b=<branch-id>&t=<static-secret>
-  /// Live:   a signed token "payload.signature" (raw, or xaadir://checkin?live=<token>)
   QrPayload parseQr(String raw) {
     final text = raw.trim();
     final bad = AuthFailure('INVALID_QR', 'This is not a Xaadir QR code.');
@@ -404,14 +442,12 @@ class ScanService {
   }
 
   // ───────────── scan → check-in / check-out ─────────────
-  /// The server decides which shift this scan belongs to; nothing shift-related
-  /// is sent from the phone, so it cannot be tampered with.
   Future<CheckinResult> submit(QrPayload qr, DeviceFacts facts) async {
-    // Fresh fingerprint proof (the server burns each challenge, so one proof = one attempt).
+    // One proof = one attempt (the server burns each challenge).
     var proof = _proof;
     _proof = null;
     if (proof == null || proof.age > _proofMaxAge) {
-      debugPrint('🔐 Proof missing or older than ${_proofMaxAge.inSeconds}s, asking finger again');
+      debugPrint('🔐 Proof missing or older than ${_proofMaxAge.inSeconds}s, asking biometric again');
       proof = await BiometricService.instance.proveIdentity(subtitle: 'Confirm to continue');
     }
 
@@ -441,12 +477,6 @@ class ScanService {
       shiftEndMin: _int(json['shift_end_min']),
       shiftsDone: _int(json['shifts_done']) ?? 0,
     );
-
-
-
-
-
-
 
     debugPrint('✅ Scan recorded → ${result.action} shift ${result.shiftNumber}/${result.shiftTotal} '
         'at ${result.timeMin} min, status=${result.status}');
