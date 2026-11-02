@@ -32,6 +32,10 @@
        <string>Xaadir needs camera access to scan codes and take photos.</string>
        <key>NSFaceIDUsageDescription</key>
        <string>Xaadir uses Face ID to securely unlock the app.</string>
+       <key>NSLocationWhenInUseUsageDescription</key>
+       <string>Xaadir uses your location to confirm you are at your branch when you check in.</string>
+       <key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
+       <string>Xaadir uses your location to confirm you are at your branch when you check in.</string>
        <key>NSPhotoLibraryUsageDescription</key>
        <string>Xaadir needs photo library access to select images.</string>
        <key>ITSAppUsesNonExemptEncryption</key>

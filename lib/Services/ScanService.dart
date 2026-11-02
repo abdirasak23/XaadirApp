@@ -441,6 +441,13 @@ class ScanService {
       shiftEndMin: _int(json['shift_end_min']),
       shiftsDone: _int(json['shifts_done']) ?? 0,
     );
+
+
+
+
+
+
+
     debugPrint('✅ Scan recorded → ${result.action} shift ${result.shiftNumber}/${result.shiftTotal} '
         'at ${result.timeMin} min, status=${result.status}');
     return result;
