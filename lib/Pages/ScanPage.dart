@@ -81,6 +81,7 @@ class _ScanPageState extends State<ScanPage>
     with WidgetsBindingObserver, SingleTickerProviderStateMixin {
   // The fingerprint prompt now runs inside preflight(), so allow more time.
   static const Duration _submitTimeout = Duration(seconds: 90);
+  static const Duration _requestTimeout = Duration(seconds: 20);
 
   final ScanService _service = ScanService.instance;
 
@@ -100,6 +101,11 @@ class _ScanPageState extends State<ScanPage>
   bool _handling = false;
   bool _openedSettings = false;
   int _seq = 0;
+
+  // "Phone not approved" → ask HR
+  bool _approvalBusy = false;
+  bool _approvalSent = false;
+  String? _approvalError;
 
   @override
   void initState() {
@@ -180,6 +186,9 @@ class _ScanPageState extends State<ScanPage>
       _failure = null;
       _scanHint = null;
       _torchOn = false;
+      _approvalBusy = false;
+      _approvalSent = false;
+      _approvalError = null;
     });
     try {
       final ctx = await _service.preflight().timeout(_submitTimeout);
@@ -213,6 +222,49 @@ class _ScanPageState extends State<ScanPage>
       if (!mounted || id != _seq) return;
       _showBlocked(AuthFailure('UNKNOWN', 'Something went wrong. Please try again.'));
     }
+  }
+
+  /// "Phone not approved" → send a request to HR.
+  /// 'approved' from the server means HR already did it, so just re-check.
+  Future<void> _requestApproval() async {
+    if (_approvalBusy) return;
+    setState(() {
+      _approvalBusy = true;
+      _approvalError = null;
+    });
+    try {
+      final status = await _service.requestDeviceApproval().timeout(_requestTimeout);
+      if (!mounted) return;
+      if (status == 'approved') {
+        _runPreflight();
+        return;
+      }
+      HapticFeedback.mediumImpact();
+      setState(() {
+        _approvalBusy = false;
+        _approvalSent = true;
+      });
+    } on TimeoutException {
+      _approvalFailed('The connection is too slow. Please try again.');
+    } on AuthFailure catch (e) {
+      if (await HomeDataService.handleSessionFailure(e)) {
+        _leave();
+        return;
+      }
+      _approvalFailed(e.message);
+    } catch (e) {
+      debugPrint('❌ Device request error: $e');
+      _approvalFailed('Could not send your request. Please try again.');
+    }
+  }
+
+  void _approvalFailed(String message) {
+    if (!mounted) return;
+    HapticFeedback.heavyImpact();
+    setState(() {
+      _approvalBusy = false;
+      _approvalError = message;
+    });
   }
 
   /// Back to the camera without redoing the location check
@@ -387,7 +439,6 @@ class _ScanPageState extends State<ScanPage>
     switch (code) {
       case 'MOCK_LOCATION':
       case 'MARKED_ABSENT':
-      case 'DEVICE_NOT_APPROVED':
       case 'BIOMETRIC_CHANGED':
       case 'BIOMETRIC_FAILED':
       case 'ENROLL_NOT_ALLOWED':
@@ -398,6 +449,7 @@ class _ScanPageState extends State<ScanPage>
       case 'ALREADY_CHECKED_OUT':
         return _C.blue;
       default:
+      // DEVICE_NOT_APPROVED lands here: orange because the user can act on it.
         return _C.orange;
     }
   }
@@ -422,7 +474,10 @@ class _ScanPageState extends State<ScanPage>
       case 'IP_NOT_ALLOWED':
         return const ['Turn off VPN or mobile data', 'Use the office Wi-Fi network'];
       case 'DEVICE_NOT_APPROVED':
-        return const ['Ask HR to approve this phone for check-in'];
+        return const [
+          'Check-in only works from a phone HR has approved',
+          'Tap "Request approval" and HR will be notified',
+        ];
       case 'WRONG_BRANCH':
         return const ['Scan the QR code that belongs to your branch'];
       case 'INVALID_QR':
@@ -499,11 +554,17 @@ class _ScanPageState extends State<ScanPage>
   Widget _buildBlocked() {
     final f = _failure ?? AuthFailure('UNKNOWN', 'Something went wrong. Please try again.');
     final code = f.code;
-    final tone = _blockedTone(code);
-    final tips = _tips(code);
+    final notApproved = code == 'DEVICE_NOT_APPROVED';
+    final sent = notApproved && _approvalSent;
+
+    Color tone = _blockedTone(code);
+    Widget leading = _Hi(_blockedIcon(code), size: 40, color: tone);
+    String title = _blockedTitle(code);
+    String subtitle = f.message;
+    List<String> tips = _tips(code);
 
     String primaryLabel;
-    VoidCallback primary;
+    VoidCallback? primary;
     String? secondaryLabel;
     VoidCallback? secondary;
 
@@ -525,6 +586,29 @@ class _ScanPageState extends State<ScanPage>
         };
         secondaryLabel = 'Try again';
         secondary = _runPreflight;
+        break;
+      case 'DEVICE_NOT_APPROVED':
+        if (sent) {
+          // request is with HR now
+          tone = _C.green;
+          leading = const _PopIn(child: Icon(Icons.check_rounded, color: _C.green, size: 46));
+          title = 'Request sent';
+          subtitle = 'HR has been notified. Once they approve this phone, tap "Check again".';
+          tips = const [
+            'You do not need to send the request again',
+            'Ask HR to approve your phone if it takes long',
+          ];
+          primaryLabel = 'Check again';
+          primary = _runPreflight;
+          secondaryLabel = 'Done';
+          secondary = () => _close();
+        } else {
+          subtitle = _approvalError ?? f.message;
+          primaryLabel = _approvalBusy ? 'Sending request…' : 'Request approval';
+          primary = _approvalBusy ? null : _requestApproval;
+          secondaryLabel = 'Try again';
+          secondary = _approvalBusy ? null : _runPreflight;
+        }
         break;
       case 'INVALID_QR':
       case 'QR_EXPIRED':
@@ -561,9 +645,9 @@ class _ScanPageState extends State<ScanPage>
 
     return _StatusView(
       tone: tone,
-      leading: _Hi(_blockedIcon(code), size: 40, color: tone),
-      title: _blockedTitle(code),
-      subtitle: f.message,
+      leading: leading,
+      title: title,
+      subtitle: subtitle,
       tips: tips,
       primaryLabel: primaryLabel,
       onPrimary: primary,
@@ -1118,6 +1202,8 @@ class _StatusView extends StatelessWidget {
                             style: ElevatedButton.styleFrom(
                               backgroundColor: _C.ink,
                               foregroundColor: Colors.white,
+                              disabledBackgroundColor: _C.ink.withAlpha(150),
+                              disabledForegroundColor: Colors.white70,
                               elevation: 0,
                               shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(30)),
                             ),

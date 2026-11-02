@@ -312,6 +312,23 @@ class ScanService {
 
   Future<void> openAppSettings() => ph.openAppSettings();
 
+  // ───────────── phone not approved: ask HR ─────────────
+  /// Sends an approval request for THIS phone to HR.
+  /// Returns the server status: 'pending' (request saved) or 'approved'
+  /// (HR already approved it, so the caller should simply re-run preflight).
+  /// No GPS / Wi-Fi / fingerprint is needed for this call.
+  Future<String> requestDeviceApproval() async {
+    debugPrint('📲 Requesting HR approval for this phone');
+    final json = await AuthService.instance.callFunction('checkin', {
+      'action': 'request_device',
+      'device_id': await AuthService.instance.deviceId(),
+      'device_name': await AuthService.instance.deviceName(),
+    });
+    final status = json['status']?.toString() ?? 'pending';
+    debugPrint('📲✅ Device request → $status');
+    return status;
+  }
+
   // ───────────── before the camera: right place, then the right finger ─────────────
   Future<ScanContextInfo> preflight() async {
     _proof = null;

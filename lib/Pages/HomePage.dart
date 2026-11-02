@@ -124,11 +124,15 @@ String fmtMoney(double v, String currency) {
 /// "−$12.50" for deductions.
 String _minus(double v, String currency) => '−${fmtMoney(v.abs(), currency)}';
 
-String _mmss(int secs) {
+/// Countdown text: "12:05" under one hour, "2:12:05" from one hour up.
+String _clock(int secs) {
   final s = secs < 0 ? 0 : secs;
-  final m = s ~/ 60;
+  final h = s ~/ 3600;
+  final m = (s % 3600) ~/ 60;
   final r = s % 60;
-  return '${m.toString().padLeft(2, '0')}:${r.toString().padLeft(2, '0')}';
+  final mm = m.toString().padLeft(2, '0');
+  final ss = r.toString().padLeft(2, '0');
+  return h > 0 ? '$h:$mm:$ss' : '$mm:$ss';
 }
 
 String _untilText(int mins) {
@@ -146,6 +150,11 @@ String _initialsOf(String name) {
 }
 
 String _cap(String s) => s.isEmpty ? s : s[0].toUpperCase() + s.substring(1);
+
+String _shortDay(DateTime d) => '${d.day} ${_monthsShort[d.month - 1]}';
+
+/// "1 Nov – 30 Nov 2026"
+String _periodText(PayrollInfo p) => '${_shortDay(p.start)} – ${_shortDay(p.end)} ${p.end.year}';
 
 /// 0 → today, 1 → tomorrow, n → in n days
 String _rel(int days) => days <= 0 ? 'today' : (days == 1 ? 'tomorrow' : 'in $days days');
@@ -313,6 +322,14 @@ class _HomeScreenState extends State<HomeScreen>
   BioGate _bio = BioGate.unknown;
   bool _autoPrompted = false;
 
+  // Month picker: null → the current month (default).
+  static const int _maxMonthsBack = 6;
+  DateTime? _picked;
+  MonthData? _pickedMonth;
+  PayrollInfo? _pickedPayroll;
+  String? _pickedError;
+  int _pickSeq = 0;
+
   late final AnimationController _fabCtrl =
   AnimationController(vsync: this, duration: const Duration(milliseconds: 200));
   late final Animation<Offset> _fabSlide = Tween<Offset>(
@@ -413,7 +430,11 @@ class _HomeScreenState extends State<HomeScreen>
     }
   }
 
-  Future<void> _onRefresh() => _load(silent: true);
+  Future<void> _onRefresh() async {
+    await _load(silent: true);
+    final d = _data;
+    if (d != null && !_isCurrent(d)) await _loadPicked(force: true);
+  }
 
   void _toast(String msg) {
     ScaffoldMessenger.of(context)
@@ -473,9 +494,7 @@ class _HomeScreenState extends State<HomeScreen>
     );
   }
 
-  void _openRecords() {
-    final data = _data;
-    if (data == null) return;
+  void _openRecords(MonthData month) {
     showModalBottomSheet<void>(
       context: context,
       isScrollControlled: true,
@@ -487,15 +506,39 @@ class _HomeScreenState extends State<HomeScreen>
         expand: false,
         builder: (ctx, controller) => _RecordsSheet(
           scrollController: controller,
-          initial: data.month,
+          initial: month,
         ),
       ),
     );
   }
 
-  void _openPayroll() {
-    final pay = _data?.payroll;
-    if (pay == null) return;
+  bool _payrollBusy = false;
+
+  /// Reloads the pay card (used by the "tap to retry" state).
+  Future<void> _retryPayroll() async {
+    final d = _data;
+    if (d == null || _payrollBusy) return;
+    if (!_isCurrent(d)) {
+      await _loadPicked(force: true);
+      return;
+    }
+    setState(() => _payrollBusy = true);
+    try {
+      final p = await _service.loadPayroll(d.month.year, d.month.month, forceRefresh: true);
+      if (!mounted) return;
+      _set(() => _data = _data?.withPayroll(p));
+    } on AuthFailure catch (e) {
+      if (await HomeDataService.handleSessionFailure(e)) return;
+      if (mounted) _toast(e.message);
+    } catch (e) {
+      debugPrint('❌ Payroll retry error: $e');
+      if (mounted) _toast('Could not load your pay. Please try again.');
+    } finally {
+      if (mounted) setState(() => _payrollBusy = false);
+    }
+  }
+
+  void _openPayroll(PayrollInfo pay) {
     debugPrint('💰 Opening payroll sheet · ${pay.year}-${pay.month}');
     showModalBottomSheet<void>(
       context: context,
@@ -647,7 +690,9 @@ class _HomeScreenState extends State<HomeScreen>
           Row(
             children: [
               Expanded(child: _Bone(height: 128, radius: 20)),
-              SizedBox(width: 16),
+              SizedBox(width: 12),
+              Expanded(child: _Bone(height: 128, radius: 20)),
+              SizedBox(width: 12),
               Expanded(child: _Bone(height: 128, radius: 20)),
             ],
           ),
@@ -700,18 +745,124 @@ class _HomeScreenState extends State<HomeScreen>
     );
   }
 
+  // ───────────── month picker ─────────────
+  DateTime _currentMonthOf(HomeData d) => DateTime(d.month.year, d.month.month);
+
+  bool _isCurrent(HomeData d) {
+    final p = _picked;
+    return p == null || (p.year == d.month.year && p.month == d.month.month);
+  }
+
+  Future<void> _openMonthPicker(HomeData d) async {
+    final cur = _currentMonthOf(d);
+    final shown = _isCurrent(d) ? cur : _picked!;
+    final res = await showModalBottomSheet<DateTime>(
+      context: context,
+      backgroundColor: Colors.transparent,
+      builder: (_) => _MonthSheet(current: cur, selected: shown, maxBack: _maxMonthsBack),
+    );
+    if (res == null || !mounted) return;
+    _selectMonth(res, d);
+  }
+
+  void _selectMonth(DateTime m, HomeData d) {
+    final cur = _currentMonthOf(d);
+    if (m.year == cur.year && m.month == cur.month) {
+      _pickSeq++;
+      setState(() {
+        _picked = null;
+        _pickedMonth = null;
+        _pickedPayroll = null;
+        _pickedError = null;
+      });
+      return;
+    }
+    if (_picked != null && _picked!.year == m.year && _picked!.month == m.month) return;
+    setState(() {
+      _picked = DateTime(m.year, m.month);
+      _pickedMonth = null;
+      _pickedPayroll = null;
+      _pickedError = null;
+    });
+    _loadPicked();
+  }
+
+  Future<void> _loadPicked({bool force = false}) async {
+    final p = _picked;
+    if (p == null) return;
+    final id = ++_pickSeq;
+    if (force && _pickedMonth == null) setState(() => _pickedError = null);
+    try {
+      final results = await Future.wait<Object?>([
+        _service.loadMonth(p.year, p.month, forceRefresh: force),
+        _service
+            .loadPayroll(p.year, p.month, forceRefresh: force)
+            .then<PayrollInfo?>((v) => v)
+            .catchError((Object _) => null),
+      ]);
+      if (!mounted || id != _pickSeq) return;
+      setState(() {
+        _pickedMonth = results[0] as MonthData;
+        _pickedPayroll = results[1] as PayrollInfo?;
+        _pickedError = null;
+      });
+    } on AuthFailure catch (e) {
+      if (!mounted || id != _pickSeq) return;
+      if (await HomeDataService.handleSessionFailure(e)) return;
+      if (!mounted) return;
+      setState(() {
+        if (_pickedMonth == null) _pickedError = e.message;
+      });
+    } catch (e) {
+      if (!mounted || id != _pickSeq) return;
+      debugPrint('❌ Picked month load error: $e');
+      setState(() {
+        if (_pickedMonth == null) _pickedError = 'Something went wrong. Please try again.';
+      });
+    }
+  }
+
+  /// One point per day (earliest check-in) built from a month's records.
+  List<ChartPoint> _chartFromRecords(List<AttRecord> recs) {
+    final byDay = <DateTime, AttRecord>{};
+    for (final r in recs) {
+      if (r.inMin == null) continue;
+      final k = dayOnly(r.date);
+      final ex = byDay[k];
+      if (ex == null || r.inMin! < ex.inMin!) byDay[k] = r;
+    }
+    final days = byDay.keys.toList()..sort();
+    return [
+      for (final k in days)
+        ChartPoint(
+          date: k,
+          inMin: byDay[k]!.inMin,
+          late: byDay[k]!.status == AttStatus.late || byDay[k]!.lateMin > 0,
+        ),
+    ];
+  }
+
   // ───────────── content ─────────────
   Widget _buildContent(HomeData d) {
-    final m = d.month;
-    final chartMinutes = [for (final p in d.chart) p.inMin];
-    final chartHasData = chartMinutes.any((v) => v != null);
+    final current = _isCurrent(d);
+    final MonthData m = current ? d.month : (_pickedMonth ?? d.month);
+    final PayrollInfo? pay = current ? d.payroll : _pickedPayroll;
+    final hasPay = pay != null && pay.monthlySalary > 0;
+    final selecting = !current && _pickedMonth == null;
+    final sel = current ? _currentMonthOf(d) : _picked!;
+    final monthLabel = '${_monthsFull[sel.month - 1]} ${sel.year}';
+    final periodLabel = current ? 'Last 14 days' : '${_monthsShort[sel.month - 1]} ${sel.year}';
 
-    final banner = _bannerFor(d);
+    final banner = current ? _bannerFor(d) : null;
 
-    final presentCaption =
-    m.partialDays > 0 ? '${m.pct}% · ${m.partialDays} partial' : '${m.pct}% attendance';
-    final absentCaption =
-    m.missedShifts > 0 && d.shifts.length > 1 ? '${m.late} late · ${m.missedShifts} missed' : '${m.late} late';
+    final List<Widget> monthBody;
+    if (selecting && _pickedError != null) {
+      monthBody = [_buildPickedError()];
+    } else if (selecting) {
+      monthBody = [_buildMonthSkeleton()];
+    } else {
+      monthBody = _buildMonthSections(d, current, m, pay, hasPay, periodLabel);
+    }
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -721,101 +872,379 @@ class _HomeScreenState extends State<HomeScreen>
           const SizedBox(height: 16),
         ],
         // Leave / sick / holiday today → the banner already says it, hide this.
-        if (!d.today.blocksCheckIn) ...[
+        if (current && !d.today.blocksCheckIn) ...[
           _TodaySection(data: d),
           const SizedBox(height: 16),
         ],
-        IntrinsicHeight(
-          child: Row(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              Expanded(
-                child: _StatCard(
-                  color: XColors.green,
-                  value: m.attended,
-                  label: 'Present',
-                  caption: presentCaption,
+        Row(
+          children: [
+            _MonthPill(label: monthLabel, isCurrent: current, onTap: () => _openMonthPicker(d)),
+            const Spacer(),
+            if (!current)
+              TextButton(
+                onPressed: () => _selectMonth(_currentMonthOf(d), d),
+                style: TextButton.styleFrom(
+                  foregroundColor: XColors.ink,
+                  minimumSize: const Size(48, 44),
+                  padding: const EdgeInsets.symmetric(horizontal: 8),
                 ),
+                child: const Text('Current month',
+                    style: TextStyle(fontFamily: XText.f, fontSize: 13, fontWeight: FontWeight.w700)),
               ),
-              const SizedBox(width: 16),
-              Expanded(
-                child: _StatCard(
-                  color: XColors.red,
-                  value: m.absent,
-                  label: 'Absent',
-                  caption: absentCaption,
-                ),
-              ),
-            ],
-          ),
-        ),
-        if (d.hasPayroll) ...[
-          const SizedBox(height: 16),
-          _PayrollCard(payroll: d.payroll!, onTap: _openPayroll),
-        ],
-        const SizedBox(height: 16),
-        _XCard(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              const Row(
-                children: [
-                  Expanded(child: Text('Check-in times', style: XText.bodyStrong)),
-                  Text('Last 14 days', style: XText.caption),
-                ],
-              ),
-              const SizedBox(height: 12),
-              if (chartHasData)
-                _CheckInChart(points: d.chart, shiftStartMin: d.shiftStartMin)
-              else
-                const _EmptyNote(
-                  icon: XIcons.chart,
-                  title: 'No check-ins yet',
-                  subtitle: 'Your arrival times will show up here after your first scan.',
-                ),
-            ],
-          ),
+          ],
         ),
         const SizedBox(height: 16),
-        _XCard(
-          padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              Row(
-                children: [
-                  const Expanded(child: Text('Last 5 days', style: XText.bodyStrong)),
-                  TextButton(
-                    onPressed: _openRecords,
-                    style: TextButton.styleFrom(
-                      foregroundColor: XColors.ink,
-                      minimumSize: const Size(48, 48),
-                      padding: const EdgeInsets.symmetric(horizontal: 8),
-                    ),
-                    child: const Text(
-                      'View all',
-                      style: TextStyle(fontFamily: XText.f, fontSize: 14, fontWeight: FontWeight.w700),
-                    ),
-                  ),
-                ],
+        ...monthBody,
+      ],
+    );
+  }
+
+  List<Widget> _buildMonthSections(
+      HomeData d,
+      bool current,
+      MonthData m,
+      PayrollInfo? pay,
+      bool hasPay,
+      String periodLabel,
+      ) {
+    final chart = current ? d.chart : _chartFromRecords(m.records);
+    final chartHasData = current ? chart.any((p) => p.inMin != null) : chart.length >= 2;
+    final recent = current ? d.recent : m.records.take(5).toList();
+
+    final presentCaption = m.partialDays > 0 ? '${m.pct}% · ${m.partialDays} part.' : '${m.pct}%';
+
+    final String lateCaption;
+    if (pay != null && pay.lateMinutes > 0) {
+      lateCaption = '${pay.lateMinutes} min';
+    } else {
+      lateCaption = m.late > 0 ? 'this month' : 'none';
+    }
+
+    final absentCaption =
+    m.missedShifts > 0 && d.shifts.length > 1 ? '${m.missedShifts} missed' : 'this month';
+
+    return [
+      IntrinsicHeight(
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Expanded(
+              child: _StatCard(
+                color: XColors.green,
+                value: m.attended,
+                label: 'Present',
+                caption: presentCaption,
               ),
-              if (d.recent.isEmpty)
-                const _EmptyNote(
-                  icon: XIcons.calendar,
-                  title: 'No records yet',
-                  subtitle: 'Scan the QR code to check in for the first time.',
-                )
-              else ...[
-                const _TableHeader(),
-                for (int i = 0; i < d.recent.length; i++) ...[
-                  if (i > 0) const _HDivider(),
-                  _TableRow(record: d.recent[i]),
-                ],
-              ],
-            ],
-          ),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: _StatCard(
+                color: XColors.orange,
+                value: m.late,
+                label: 'Late',
+                caption: lateCaption,
+              ),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: _StatCard(
+                color: XColors.red,
+                value: m.absent,
+                label: 'Absent',
+                caption: absentCaption,
+              ),
+            ),
+          ],
+        ),
+      ),
+      if (current || pay != null) ...[
+        const SizedBox(height: 16),
+        _PayrollCard(
+          payroll: pay,
+          busy: _payrollBusy,
+          onTap: pay == null
+              ? _retryPayroll
+              : (pay.monthlySalary > 0 ? () => _openPayroll(pay) : null),
         ),
       ],
+      const SizedBox(height: 16),
+      _XCard(
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                const Expanded(child: Text('Check-in times', style: XText.bodyStrong)),
+                Text(periodLabel, style: XText.caption),
+              ],
+            ),
+            const SizedBox(height: 12),
+            if (chartHasData)
+              _CheckInChart(
+                key: ValueKey<String>('chart-$periodLabel'),
+                points: chart,
+                shiftStartMin: d.shiftStartMin,
+              )
+            else
+              _EmptyNote(
+                icon: XIcons.chart,
+                title: current ? 'No check-ins yet' : 'Not enough check-ins',
+                subtitle: current
+                    ? 'Your arrival times will show up here after your first scan.'
+                    : 'Check-in times appear here when the month has at least two.',
+              ),
+          ],
+        ),
+      ),
+      const SizedBox(height: 16),
+      _XCard(
+        padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Row(
+              children: [
+                Expanded(child: Text(current ? 'Last 5 days' : 'Latest records', style: XText.bodyStrong)),
+                TextButton(
+                  onPressed: () => _openRecords(m),
+                  style: TextButton.styleFrom(
+                    foregroundColor: XColors.ink,
+                    minimumSize: const Size(48, 48),
+                    padding: const EdgeInsets.symmetric(horizontal: 8),
+                  ),
+                  child: const Text(
+                    'View all',
+                    style: TextStyle(fontFamily: XText.f, fontSize: 14, fontWeight: FontWeight.w700),
+                  ),
+                ),
+              ],
+            ),
+            if (recent.isEmpty)
+              _EmptyNote(
+                icon: XIcons.calendar,
+                title: current ? 'No records yet' : 'No records this month',
+                subtitle: current
+                    ? 'Scan the QR code to check in for the first time.'
+                    : 'Nothing was recorded for this month.',
+              )
+            else ...[
+              const _TableHeader(),
+              for (int i = 0; i < recent.length; i++) ...[
+                if (i > 0) const _HDivider(),
+                _TableRow(record: recent[i]),
+              ],
+            ],
+          ],
+        ),
+      ),
+    ];
+  }
+
+  Widget _buildMonthSkeleton() {
+    return const _Shimmer(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Expanded(child: _Bone(height: 128, radius: 20)),
+              SizedBox(width: 12),
+              Expanded(child: _Bone(height: 128, radius: 20)),
+              SizedBox(width: 12),
+              Expanded(child: _Bone(height: 128, radius: 20)),
+            ],
+          ),
+          SizedBox(height: 16),
+          _Bone(height: 88, radius: 20),
+          SizedBox(height: 16),
+          _Bone(height: 240, radius: 20),
+          SizedBox(height: 16),
+          _Bone(height: 340, radius: 20),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildPickedError() {
+    return _XCard(
+      child: Column(
+        children: [
+          const SizedBox(height: 8),
+          Container(
+            width: 48,
+            height: 48,
+            decoration: BoxDecoration(color: _tint(XColors.red, 0.14), shape: BoxShape.circle),
+            child: const Center(child: _Hi(XIcons.alert, size: 24, color: XColors.red)),
+          ),
+          const SizedBox(height: 16),
+          const Text('Could not load this month', style: XText.bodyStrong),
+          const SizedBox(height: 4),
+          Text(_pickedError ?? '', textAlign: TextAlign.center, style: XText.caption.copyWith(fontSize: 13)),
+          const SizedBox(height: 20),
+          SizedBox(
+            height: 48,
+            child: ElevatedButton.icon(
+              onPressed: () => _loadPicked(force: true),
+              style: ElevatedButton.styleFrom(
+                backgroundColor: XColors.ink,
+                foregroundColor: Colors.white,
+                elevation: 0,
+                padding: const EdgeInsets.symmetric(horizontal: 24),
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(24)),
+              ),
+              icon: const _Hi(XIcons.refresh, size: 20, color: Colors.white),
+              label: const Text('Retry', style: TextStyle(fontFamily: XText.f, fontWeight: FontWeight.w600)),
+            ),
+          ),
+          const SizedBox(height: 8),
+        ],
+      ),
+    );
+  }
+}
+
+// ════════════════════════════════════════════════════════════════════
+//  MONTH PICKER (pill + bottom sheet)
+// ════════════════════════════════════════════════════════════════════
+class _MonthPill extends StatelessWidget {
+  const _MonthPill({required this.label, required this.isCurrent, required this.onTap});
+  final String label;
+  final bool isCurrent;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return Semantics(
+      button: true,
+      label: 'Change month. Showing $label',
+      child: Material(
+        color: XColors.card,
+        borderRadius: BorderRadius.circular(XRadius.chip),
+        clipBehavior: Clip.antiAlias,
+        child: InkWell(
+          onTap: onTap,
+          child: Container(
+            height: 44,
+            padding: const EdgeInsets.symmetric(horizontal: 14),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const _Hi(XIcons.calendar, size: 18),
+                const SizedBox(width: 8),
+                Text(label, style: XText.bodyStrong),
+                const SizedBox(width: 4),
+                const Icon(Icons.keyboard_arrow_down_rounded, size: 22, color: XColors.ink),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _MonthSheet extends StatelessWidget {
+  const _MonthSheet({required this.current, required this.selected, required this.maxBack});
+  final DateTime current;
+  final DateTime selected;
+  final int maxBack;
+
+  @override
+  Widget build(BuildContext context) {
+    final bottomInset = MediaQuery.of(context).padding.bottom;
+    final months = [for (int i = 0; i <= maxBack; i++) DateTime(current.year, current.month - i)];
+
+    return Container(
+      decoration: const BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.vertical(top: Radius.circular(XRadius.sheet)),
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const SizedBox(height: 12),
+          Container(
+            width: 40,
+            height: 4,
+            decoration: BoxDecoration(color: const Color(0xFFD1D5DB), borderRadius: BorderRadius.circular(2)),
+          ),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(20, 12, 8, 0),
+            child: Row(
+              children: [
+                const Expanded(child: Text('Select month', style: XText.title)),
+                IconButton(
+                  onPressed: () => Navigator.of(context).maybePop(),
+                  constraints: const BoxConstraints(minWidth: 48, minHeight: 48),
+                  icon: const _Hi(XIcons.close, size: 22),
+                ),
+              ],
+            ),
+          ),
+          Flexible(
+            child: ListView(
+              shrinkWrap: true,
+              padding: EdgeInsets.fromLTRB(12, 4, 12, 16 + bottomInset),
+              children: [
+                for (int i = 0; i < months.length; i++)
+                  _MonthRow(
+                    month: months[i],
+                    isCurrent: i == 0,
+                    isSelected: months[i].year == selected.year && months[i].month == selected.month,
+                    onTap: () => Navigator.of(context).pop(months[i]),
+                  ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _MonthRow extends StatelessWidget {
+  const _MonthRow({
+    required this.month,
+    required this.isCurrent,
+    required this.isSelected,
+    required this.onTap,
+  });
+  final DateTime month;
+  final bool isCurrent;
+  final bool isSelected;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 2),
+      child: Material(
+        color: isSelected ? XColors.card : Colors.transparent,
+        borderRadius: BorderRadius.circular(16),
+        clipBehavior: Clip.antiAlias,
+        child: InkWell(
+          onTap: onTap,
+          child: Container(
+            height: 56,
+            padding: const EdgeInsets.symmetric(horizontal: 16),
+            child: Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    '${_monthsFull[month.month - 1]} ${month.year}',
+                    style: isSelected ? XText.bodyStrong : XText.body,
+                  ),
+                ),
+                if (isCurrent) ...[
+                  const _Tag('Current', XColors.green),
+                  const SizedBox(width: 8),
+                ],
+                if (isSelected) const Icon(Icons.check_rounded, size: 22, color: XColors.ink),
+              ],
+            ),
+          ),
+        ),
+      ),
     );
   }
 }
@@ -866,6 +1295,8 @@ class _TodaySectionState extends State<_TodaySection> {
     super.dispose();
   }
 
+  /// Picks the shift to announce: a started shift waiting for check-in wins,
+  /// otherwise the next upcoming shift of the day (no 1-hour limit anymore).
   _BadgeInfo? _badgeFor(List<TodayShift> shifts, int nowMin, int nowSec) {
     TodayShift? next;
     for (final s in shifts) {
@@ -873,7 +1304,7 @@ class _TodaySectionState extends State<_TodaySection> {
       if (p == ShiftPhase.ready) return _BadgeInfo(s, null);
       if (p == ShiftPhase.upcoming) {
         final secs = s.startMin * 60 - nowSec;
-        if (secs > 0 && secs <= 3600 && (next == null || s.startMin < next.startMin)) next = s;
+        if (secs > 0 && (next == null || s.startMin < next.startMin)) next = s;
       }
     }
     return next == null ? null : _BadgeInfo(next, next.startMin * 60 - nowSec);
@@ -883,12 +1314,14 @@ class _TodaySectionState extends State<_TodaySection> {
   Widget build(BuildContext context) {
     final d = widget.data;
     final info = d.today;
+
+    // Always use the device clock so the countdown never disappears
+    // because of a server/device date mismatch.
     final now = DateTime.now();
-    final live = dayOnly(now) == dayOnly(d.serverDate);
-    final nowMin = live ? now.hour * 60 + now.minute : -1;
+    final nowMin = now.hour * 60 + now.minute;
     final nowSec = now.hour * 3600 + now.minute * 60 + now.second;
 
-    final badge = live ? _badgeFor(info.shifts, nowMin, nowSec) : null;
+    final badge = _badgeFor(info.shifts, nowMin, nowSec);
 
     // Tick every second only while a countdown is on screen.
     final want = (badge?.secsToStart != null) ? _fast : _slow;
@@ -919,15 +1352,18 @@ class _UpcomingBadge extends StatelessWidget {
   Widget build(BuildContext context) {
     final s = info.shift;
     final started = info.secsToStart == null;
+    final soon = !started && info.secsToStart! <= 3600;
     final c = started ? XColors.orange : XColors.blue;
     final name = multi ? 'Shift ${s.number}' : 'Your shift';
-    final title = started ? '$name has started' : '$name starts soon';
+    final title = started
+        ? '$name has started'
+        : (soon ? '$name starts soon' : '$name starts at ${fmtMin(s.startMin)}');
     final sub = started ? 'Scan to check in · ${fmtRange(s.startMin, s.endMin)}' : fmtRange(s.startMin, s.endMin);
 
     return Semantics(
       container: true,
       liveRegion: false,
-      label: started ? '$title. Scan to check in.' : '$title in ${_mmss(info.secsToStart!)}',
+      label: started ? '$title. Scan to check in.' : '$title. Starts in ${_clock(info.secsToStart!)}',
       child: Container(
         width: double.infinity,
         padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
@@ -970,7 +1406,7 @@ class _UpcomingBadge extends StatelessWidget {
                 alignment: Alignment.center,
                 decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(XRadius.chip)),
                 child: Text(
-                  _mmss(info.secsToStart!),
+                  _clock(info.secsToStart!),
                   style: TextStyle(
                     fontFamily: XText.f,
                     fontSize: 13,
@@ -1189,8 +1625,16 @@ class _ShiftTimelineRow extends StatelessWidget {
                             overflow: TextOverflow.ellipsis,
                             style: XText.caption.copyWith(
                               fontSize: 12.5,
-                              color: phase == ShiftPhase.missed || phase == ShiftPhase.ready ? ui.color : XColors.textDim,
-                              fontWeight: phase == ShiftPhase.missed || phase == ShiftPhase.ready
+                              color: phase == ShiftPhase.missed ||
+                                  phase == ShiftPhase.ready ||
+                                  phase == ShiftPhase.onShiftLate ||
+                                  phase == ShiftPhase.completedLate
+                                  ? ui.color
+                                  : XColors.textDim,
+                              fontWeight: phase == ShiftPhase.missed ||
+                                  phase == ShiftPhase.ready ||
+                                  phase == ShiftPhase.onShiftLate ||
+                                  phase == ShiftPhase.completedLate
                                   ? FontWeight.w600
                                   : FontWeight.w400,
                             )),
@@ -1213,80 +1657,199 @@ class _ShiftTimelineRow extends StatelessWidget {
 //  PAYROLL CARD (home)
 // ════════════════════════════════════════════════════════════════════
 class _PayrollCard extends StatelessWidget {
-  const _PayrollCard({required this.payroll, required this.onTap});
-  final PayrollInfo payroll;
-  final VoidCallback onTap;
+  const _PayrollCard({required this.payroll, required this.onTap, this.busy = false});
+  final PayrollInfo? payroll;
+  final VoidCallback? onTap;
+  final bool busy;
 
-  @override
-  Widget build(BuildContext context) {
-    final p = payroll;
-    final cur = p.currency;
-
+  Widget _shell(Widget child, String label) {
     return Semantics(
-      button: true,
-      label: 'Salary ${fmtMoney(p.monthlySalary, cur)}. Open payroll details.',
+      button: onTap != null,
+      label: label,
       child: Material(
         color: XColors.card,
         borderRadius: BorderRadius.circular(XRadius.card),
         clipBehavior: Clip.antiAlias,
         child: InkWell(
-          onTap: onTap,
-          child: Padding(
-            padding: const EdgeInsets.all(16),
+          onTap: busy ? null : onTap,
+          child: Padding(padding: const EdgeInsets.all(16), child: child),
+        ),
+      ),
+    );
+  }
+
+  Widget _notice(dynamic icon, String title, String sub) {
+    return Row(
+      children: [
+        Container(
+          width: 40,
+          height: 40,
+          decoration: const BoxDecoration(color: Colors.white, shape: BoxShape.circle),
+          child: Center(
+            child: busy
+                ? const SizedBox(
+                width: 18,
+                height: 18,
+                child: CircularProgressIndicator(strokeWidth: 2.2, color: XColors.ink))
+                : _Hi(icon, size: 20),
+          ),
+        ),
+        const SizedBox(width: 12),
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(title, style: XText.bodyStrong),
+              const SizedBox(height: 2),
+              Text(sub, style: XText.caption.copyWith(fontSize: 13)),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final p = payroll;
+
+    // 1 ─ the server did not send any pay data
+    if (p == null) {
+      return _shell(
+        _notice(XIcons.refresh, 'Your pay is not available', busy ? 'Loading…' : 'Tap to try again'),
+        'Pay not available. Tap to try again.',
+      );
+    }
+
+    // 2 ─ HR has not set a salary yet
+    if (p.monthlySalary <= 0) {
+      return _shell(
+        _notice(XIcons.info, 'Salary not set', 'HR has not set your monthly salary yet.'),
+        'Salary not set.',
+      );
+    }
+
+    final cur = p.currency;
+    final live = p.isEstimate;
+    final title = live ? "This month's pay" : '${_monthsFull[p.month - 1]} pay';
+    final big = live ? p.earnedNow : p.estimatedNet;
+    final pct = (p.progress * 100).round();
+    final lateCount = p.lateEvents.length;
+    final hasLate = lateCount > 0 || p.lateMinutes > 0;
+
+    return _shell(
+      Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Container(
+                  width: 8,
+                  height: 8,
+                  decoration: const BoxDecoration(color: XColors.blue, shape: BoxShape.circle)),
+              const SizedBox(width: 8),
+              Expanded(child: Text(title, style: XText.body.copyWith(color: XColors.textDim))),
+              _Tag(live ? 'Estimate' : 'Final', live ? XColors.blue : XColors.green),
+              const SizedBox(width: 8),
+              Container(
+                width: 32,
+                height: 32,
+                decoration: const BoxDecoration(color: Colors.white, shape: BoxShape.circle),
+                child: const Center(child: _Hi(XIcons.next, size: 18)),
+              ),
+            ],
+          ),
+          const SizedBox(height: 14),
+          Text(live ? 'Earned so far' : 'Net pay', style: XText.caption),
+          const SizedBox(height: 2),
+          FittedBox(
+            fit: BoxFit.scaleDown,
+            alignment: Alignment.centerLeft,
+            child: Text(fmtMoney(big, cur), maxLines: 1, style: XText.number.copyWith(fontSize: 36)),
+          ),
+          const SizedBox(height: 12),
+          ClipRRect(
+            borderRadius: BorderRadius.circular(3),
+            child: LinearProgressIndicator(
+              value: p.progress,
+              minHeight: 6,
+              backgroundColor: XColors.border,
+              valueColor: const AlwaysStoppedAnimation<Color>(XColors.green),
+            ),
+          ),
+          const SizedBox(height: 6),
+          Row(
+            children: [
+              Expanded(
+                child: Text(_periodText(p),
+                    maxLines: 1, overflow: TextOverflow.ellipsis, style: XText.caption.copyWith(fontSize: 11.5)),
+              ),
+              Text(live ? '$pct% of the month' : 'Month closed', style: XText.caption.copyWith(fontSize: 11.5)),
+            ],
+          ),
+          const SizedBox(height: 14),
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
+            decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(16)),
             child: Row(
               children: [
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Row(
-                        children: [
-                          Container(
-                              width: 8,
-                              height: 8,
-                              decoration: const BoxDecoration(color: XColors.blue, shape: BoxShape.circle)),
-                          const SizedBox(width: 8),
-                          Text('Salary', style: XText.body.copyWith(color: XColors.textDim)),
-                        ],
-                      ),
-                      const SizedBox(height: 8),
-                      FittedBox(
-                        fit: BoxFit.scaleDown,
-                        alignment: Alignment.centerLeft,
-                        child: Text(fmtMoney(p.monthlySalary, cur), maxLines: 1, style: XText.number),
-                      ),
-                      const SizedBox(height: 4),
-                      p.hasDeductions
-                          ? Text.rich(
-                        TextSpan(
-                          style: XText.caption,
-                          children: [
-                            TextSpan(text: '${p.isEstimate ? 'Est. net' : 'Net'} ${fmtMoney(p.estimatedNet, cur)} · '),
-                            TextSpan(
-                              text: '${_minus(p.totalDeduction, cur)} deducted',
-                              style: const TextStyle(color: XColors.orange, fontWeight: FontWeight.w600),
-                            ),
-                          ],
-                        ),
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                      )
-                          : Text('No deductions this month',
-                          maxLines: 1, overflow: TextOverflow.ellipsis, style: XText.caption),
-                    ],
-                  ),
+                _PayStat('Base salary', fmtMoney(p.monthlySalary, cur), XColors.text),
+                Container(width: 1, height: 28, color: XColors.border),
+                _PayStat(
+                  'Deductions',
+                  p.hasDeductions ? _minus(p.totalDeduction, cur) : fmtMoney(0, cur),
+                  p.hasDeductions ? XColors.orange : XColors.text,
                 ),
-                const SizedBox(width: 12),
-                Container(
-                  width: 40,
-                  height: 40,
-                  decoration: const BoxDecoration(color: Colors.white, shape: BoxShape.circle),
-                  child: const Center(child: _Hi(XIcons.next, size: 20)),
-                ),
+                Container(width: 1, height: 28, color: XColors.border),
+                _PayStat(live ? 'Est. net' : 'Net', fmtMoney(p.estimatedNet, cur), XColors.text),
               ],
             ),
           ),
-        ),
+          if (hasLate) ...[
+            const SizedBox(height: 10),
+            Text(
+              'Late ${lateCount > 0 ? '$lateCount ${lateCount == 1 ? 'time' : 'times'} · ' : ''}${p.lateMinutes} min'
+                  '${p.latenessDeduction > 0 ? ' · ${_minus(p.latenessDeduction, cur)}' : ''}',
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: XText.caption.copyWith(color: XColors.orange, fontWeight: FontWeight.w600),
+            ),
+          ],
+          if (p.unexcusedAbsentDays > 0) ...[
+            const SizedBox(height: 4),
+            Text(
+              'Absent ${p.unexcusedAbsentDays} ${p.unexcusedAbsentDays == 1 ? 'day' : 'days'}'
+                  '${p.absenceDeduction > 0 ? ' · ${_minus(p.absenceDeduction, cur)}' : ''}',
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: XText.caption.copyWith(color: XColors.red, fontWeight: FontWeight.w600),
+            ),
+          ],
+        ],
+      ),
+      'This month pay ${fmtMoney(big, cur)}. Open payroll details.',
+    );
+  }
+}
+
+class _PayStat extends StatelessWidget {
+  const _PayStat(this.label, this.value, this.color);
+  final String label;
+  final String value;
+  final Color color;
+
+  @override
+  Widget build(BuildContext context) {
+    return Expanded(
+      child: Column(
+        children: [
+          Text(label, maxLines: 1, overflow: TextOverflow.ellipsis, style: XText.caption.copyWith(fontSize: 11.5)),
+          const SizedBox(height: 2),
+          FittedBox(
+            fit: BoxFit.scaleDown,
+            child: Text(value, maxLines: 1, style: XText.bodyStrong.copyWith(color: color, fontSize: 13)),
+          ),
+        ],
       ),
     );
   }
@@ -1540,27 +2103,42 @@ class _PayrollBody extends StatelessWidget {
     final cur = p.currency;
     final lates = p.lateEvents;
 
+    // Show the summary when anything happened: deduction, late minutes or absences.
+    final showSummary = p.monthlySalary > 0;
+
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
         _NetPayHero(payroll: p),
         const SizedBox(height: 16),
 
-        // Summary only when something was actually deducted.
-        if (p.hasDeductions) ...[
+        if (showSummary) ...[
           _XCard(
             padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
             child: Column(
               children: [
                 _KV('Monthly salary', fmtMoney(p.monthlySalary, cur)),
+                if (p.dailySalary != null) ...[
+                  const _HDivider(),
+                  _KV('Daily salary', fmtMoney(p.dailySalary!, cur)),
+                ],
+                if (p.expectedDays != null && p.expectedDays! > 0) ...[
+                  const _HDivider(),
+                  _KV('Attendance', '${p.attendanceDays ?? 0} of ${p.expectedDays} days'),
+                ],
                 const _HDivider(),
-                _KV('Late minutes', '${p.lateMinutes} min'),
+                _KV('Late minutes', '${p.lateMinutes} min',
+                    valueColor: p.lateMinutes > 0 ? XColors.orange : XColors.text),
                 const _HDivider(),
-                _KV('Lateness deductions', _minus(p.latenessDeduction, cur), valueColor: XColors.orange),
+                _KV('Lateness deductions',
+                    p.latenessDeduction > 0 ? _minus(p.latenessDeduction, cur) : fmtMoney(0, cur),
+                    valueColor: p.latenessDeduction > 0 ? XColors.orange : XColors.text),
                 const _HDivider(),
                 _KV('Unexcused absent days', '${p.unexcusedAbsentDays}'),
                 const _HDivider(),
-                _KV('Absence deductions', _minus(p.absenceDeduction, cur), valueColor: XColors.red),
+                _KV('Absence deductions',
+                    p.absenceDeduction > 0 ? _minus(p.absenceDeduction, cur) : fmtMoney(0, cur),
+                    valueColor: p.absenceDeduction > 0 ? XColors.red : XColors.text),
                 const _HDivider(),
                 _KV(p.isEstimate ? 'Estimated net pay' : 'Net pay', fmtMoney(p.estimatedNet, cur), strong: true),
               ],
@@ -1672,6 +2250,11 @@ class _NetPayHero extends StatelessWidget {
           Text(
             'Monthly salary ${fmtMoney(p.monthlySalary, p.currency)}',
             style: XText.caption.copyWith(color: Colors.white70, fontSize: 13),
+          ),
+          const SizedBox(height: 2),
+          Text(
+            'Period ${_periodText(p)} · ${p.currency}',
+            style: XText.caption.copyWith(color: Colors.white70, fontSize: 12),
           ),
         ],
       ),
@@ -2659,11 +3242,15 @@ class _TodayPill extends StatelessWidget {
 
     switch (info.state) {
       case TodayState.checkedOut:
-        label = 'Checked out ${fmtMin(info.outMin ?? 0)}';
-        color = XColors.ink;
+        label = info.lateMin > 0
+            ? 'Out ${fmtMin(info.outMin ?? 0)} · was ${info.lateMin} min late'
+            : 'Checked out ${fmtMin(info.outMin ?? 0)}';
+        color = info.lateMin > 0 ? XColors.orange : XColors.ink;
         break;
       case TodayState.late:
-        label = 'Late ${info.lateMin} min';
+        label = info.inMin != null
+            ? 'Late ${info.lateMin} min · in ${fmtMin(info.inMin!)}'
+            : 'Late ${info.lateMin} min';
         color = XColors.orange;
         break;
       case TodayState.checkedIn:
@@ -2736,23 +3323,28 @@ class _StatCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return _XCard(
+      padding: const EdgeInsets.all(14),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Row(
             children: [
               Container(width: 8, height: 8, decoration: BoxDecoration(color: color, shape: BoxShape.circle)),
-              const SizedBox(width: 8),
+              const SizedBox(width: 6),
               Expanded(
                 child: Text(label,
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
-                    style: XText.body.copyWith(color: XColors.textDim)),
+                    style: XText.body.copyWith(color: XColors.textDim, fontSize: 13)),
               ),
             ],
           ),
           const SizedBox(height: 8),
-          Text('$value', style: XText.number),
+          FittedBox(
+            fit: BoxFit.scaleDown,
+            alignment: Alignment.centerLeft,
+            child: Text('$value', style: XText.number),
+          ),
           const SizedBox(height: 4),
           Text(caption, maxLines: 1, overflow: TextOverflow.ellipsis, style: XText.caption),
         ],
@@ -3038,7 +3630,7 @@ class _Bone extends StatelessWidget {
 //  CHECK-IN CHART (custom painter, no packages)
 // ════════════════════════════════════════════════════════════════════
 class _CheckInChart extends StatefulWidget {
-  const _CheckInChart({required this.points, required this.shiftStartMin});
+  const _CheckInChart({super.key, required this.points, required this.shiftStartMin});
   final List<ChartPoint> points;
   final int shiftStartMin;
 
@@ -3190,7 +3782,7 @@ class _ChartPainter extends CustomPainter {
       final p = pts[s]!;
       final d = points[s].date;
       final tp = _tp(
-        '${d.day} ${_monthsShort[d.month - 1]} · ${fmtMin(points[s].inMin!)}',
+        '${d.day} ${_monthsShort[d.month - 1]} · ${fmtMin(points[s].inMin!)}${points[s].late ? ' · late' : ''}',
         const TextStyle(fontFamily: XText.f, fontSize: 12, fontWeight: FontWeight.w600, color: Colors.white),
       );
       const padH = 10.0, padV = 6.0;

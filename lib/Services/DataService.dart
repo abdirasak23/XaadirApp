@@ -44,7 +44,7 @@ enum PayKind { onTime, late, unexcused, leave, sick, holiday, future }
 // ════════════════════════════════════════════════════════════════════
 int? _i(dynamic v) {
   if (v is num) return v.toInt();
-  if (v is String) return int.tryParse(v);
+  if (v is String) return int.tryParse(v) ?? double.tryParse(v)?.toInt();
   return null;
 }
 
@@ -56,6 +56,7 @@ double? _d(dynamic v) {
 
 bool? _b(dynamic v) {
   if (v is bool) return v;
+  if (v is num) return v != 0;
   if (v is String) {
     final s = v.toLowerCase();
     if (s == 'true') return true;
@@ -70,6 +71,15 @@ List<dynamic> _l(dynamic v) => v is List ? v : const [];
 String? _s(dynamic v) {
   final s = v?.toString().trim() ?? '';
   return s.isEmpty ? null : s;
+}
+
+/// First non-null value among several possible key names.
+dynamic _first(Map<String, dynamic> m, List<String> keys) {
+  for (final k in keys) {
+    final v = m[k];
+    if (v != null) return v;
+  }
+  return null;
 }
 
 /// Parses a calendar date WITHOUT timezone drift.
@@ -125,6 +135,17 @@ TodayState _todayStateOf(dynamic st) {
     default:
       return TodayState.notCheckedIn;
   }
+}
+
+/// Makes the state agree with the data: a person who checked in with
+/// late minutes is LATE, and a person with times is never "not checked in".
+TodayState _fixState(TodayState s, {int? inMin, int? outMin, required int lateMin}) {
+  if (s == TodayState.notCheckedIn && inMin != null) {
+    if (outMin != null) return TodayState.checkedOut;
+    return lateMin > 0 ? TodayState.late : TodayState.checkedIn;
+  }
+  if (s == TodayState.checkedIn && lateMin > 0) return TodayState.late;
+  return s;
 }
 
 PayKind _payKindOf(dynamic k) {
@@ -199,7 +220,8 @@ class TodayShift {
       case TodayState.checkedOut:
         return lateMin > 0 ? ShiftPhase.completedLate : ShiftPhase.completed;
       case TodayState.checkedIn:
-        return ShiftPhase.onShift;
+        if (outMin != null) return lateMin > 0 ? ShiftPhase.completedLate : ShiftPhase.completed;
+        return lateMin > 0 ? ShiftPhase.onShiftLate : ShiftPhase.onShift;
       case TodayState.late:
         if (outMin != null) return ShiftPhase.completedLate;
         return ShiftPhase.onShiftLate;
@@ -241,10 +263,10 @@ class TodayInfo {
       state == TodayState.leave || state == TodayState.sick || state == TodayState.holiday;
 
   factory TodayInfo.fromJson(Map<String, dynamic> j, List<ShiftDef> schedule) {
-    final state = _todayStateOf(j['state']);
     final inMin = _i(j['in_min']);
     final outMin = _i(j['out_min']);
     final lateMin = _i(j['late_min']) ?? 0;
+    final state = _fixState(_todayStateOf(j['state']), inMin: inMin, outMin: outMin, lateMin: lateMin);
     final note = _s(j['note']);
 
     final byNumber = {for (final s in schedule) s.number: s};
@@ -256,14 +278,17 @@ class TodayInfo {
         final r = _m(raw[k]);
         final n = _i(r['shift_number']) ?? _i(r['number']) ?? (k + 1);
         final def = byNumber[n];
+        final rIn = _i(r['in_min']);
+        final rOut = _i(r['out_min']);
+        final rLate = _i(r['late_min']) ?? 0;
         shifts.add(TodayShift(
           number: n,
           startMin: _i(r['start_min']) ?? def?.startMin ?? 8 * 60,
           endMin: _i(r['end_min']) ?? def?.endMin ?? 17 * 60,
-          state: _todayStateOf(r['state']),
-          inMin: _i(r['in_min']),
-          outMin: _i(r['out_min']),
-          lateMin: _i(r['late_min']) ?? 0,
+          state: _fixState(_todayStateOf(r['state']), inMin: rIn, outMin: rOut, lateMin: rLate),
+          inMin: rIn,
+          outMin: rOut,
+          lateMin: rLate,
           note: _s(r['note']),
         ));
       }
@@ -330,17 +355,23 @@ class AttRecord {
   bool get isTimeOff =>
       status == AttStatus.leave || status == AttStatus.sick || status == AttStatus.holiday;
 
-  factory AttRecord.fromJson(Map<String, dynamic> j) => AttRecord(
-    date: _date(j['date']),
-    inMin: _i(j['in_min']),
-    outMin: _i(j['out_min']),
-    lateMin: _i(j['late_min']) ?? 0,
-    status: _statusOf(j['status']),
-    source: j['source'] == 'manual' ? AttSource.manual : AttSource.qr,
-    note: _s(j['note']),
-    shiftNumber: _i(j['shift_number']) ?? 1,
-    shiftTotal: _i(j['shift_total']) ?? 1,
-  );
+  factory AttRecord.fromJson(Map<String, dynamic> j) {
+    final lateMin = _i(j['late_min']) ?? 0;
+    var status = _statusOf(j['status']);
+    // Backend says "present" but the person arrived late → show Late.
+    if (status == AttStatus.present && lateMin > 0) status = AttStatus.late;
+    return AttRecord(
+      date: _date(j['date']),
+      inMin: _i(j['in_min']),
+      outMin: _i(j['out_min']),
+      lateMin: lateMin,
+      status: status,
+      source: j['source'] == 'manual' ? AttSource.manual : AttSource.qr,
+      note: _s(j['note']),
+      shiftNumber: _i(j['shift_number']) ?? 1,
+      shiftTotal: _i(j['shift_total']) ?? 1,
+    );
+  }
 }
 
 class Holiday {
@@ -454,18 +485,24 @@ class MonthData {
     final now = DateTime.now();
     final key = (j['key']?.toString() ?? '').split('-');
     final s = _m(j['summary']);
+    final records = [for (final r in _l(j['records'])) AttRecord.fromJson(_m(r))];
+
+    // If the summary has no late count, count it from the records.
+    final lateFromSummary = _i(_first(s, ['late', 'late_count', 'late_days']));
+    final lateCount = lateFromSummary ?? records.where((r) => r.status == AttStatus.late).length;
+
     return MonthData(
       year: key.length == 2 ? int.tryParse(key[0]) ?? now.year : now.year,
       month: key.length == 2 ? int.tryParse(key[1]) ?? now.month : now.month,
       present: _i(s['present']) ?? 0,
-      late: _i(s['late']) ?? 0,
+      late: lateCount,
       absent: _i(s['absent']) ?? 0,
       attended: _i(s['attended']) ?? 0,
       workingDays: _i(s['working_days']) ?? 0,
       pct: _i(s['attendance_pct']) ?? 0,
       partialDays: _i(s['partial_days']) ?? 0,
       missedShifts: _i(s['missed_shifts']) ?? 0,
-      records: [for (final r in _l(j['records'])) AttRecord.fromJson(_m(r))],
+      records: records,
     );
   }
 }
@@ -500,26 +537,34 @@ class PayShift {
   final bool isEstimate;
   final String? note;
 
-  factory PayShift.fromJson(Map<String, dynamic> j, int fallbackNumber, bool monthIsEstimate) => PayShift(
-    number: _i(j['shift_number']) ?? _i(j['number']) ?? fallbackNumber,
-    schedStartMin: _i(j['start_min']) ?? 8 * 60,
-    schedEndMin: _i(j['end_min']) ?? 17 * 60,
-    kind: _payKindOf(j['kind']),
-    inMin: _i(j['in_min']),
-    outMin: _i(j['out_min']),
-    lateMin: _i(j['late_min']) ?? 0,
-    countedLateMin: _i(j['counted_late_min']) ?? 0,
-    deduction: _d(j['deduction']) ?? 0,
-    isEstimate: _b(j['is_estimate']) ?? monthIsEstimate,
-    note: _s(j['note']),
-  );
+  factory PayShift.fromJson(Map<String, dynamic> j, int fallbackNumber, bool monthIsEstimate) {
+    final late = _i(j['late_min']) ?? 0;
+    var kind = _payKindOf(_first(j, ['kind', 'status']));
+    // A shift with late minutes is a late shift even if the backend said on-time.
+    if (kind == PayKind.onTime && late > 0) kind = PayKind.late;
+
+    return PayShift(
+      number: _i(j['shift_number']) ?? _i(j['number']) ?? fallbackNumber,
+      schedStartMin: _i(j['start_min']) ?? 8 * 60,
+      schedEndMin: _i(j['end_min']) ?? 17 * 60,
+      kind: kind,
+      inMin: _i(j['in_min']),
+      outMin: _i(j['out_min']),
+      lateMin: late,
+      countedLateMin: _i(_first(j, ['counted_late_min', 'counted_late'])) ?? 0,
+      deduction: _d(j['deduction']) ?? 0,
+      isEstimate: _b(j['is_estimate']) ?? monthIsEstimate,
+      note: _s(j['note']),
+    );
+  }
 }
 
 class PayDay {
-  const PayDay({required this.date, required this.shifts});
+  const PayDay({required this.date, required this.shifts, this.holidayName});
 
   final DateTime date;
   final List<PayShift> shifts;
+  final String? holidayName; // set when the company marked this date as a holiday
 
   bool get isMulti => shifts.length > 1;
   double get deduction => shifts.fold(0.0, (a, s) => a + s.deduction);
@@ -548,6 +593,15 @@ class PayrollInfo {
     required this.estimatedNet,
     required this.isEstimate,
     required this.days,
+    this.periodStart,
+    this.periodEnd,
+    this.workingDays,
+    this.elapsedWorkingDays,
+    this.earnedSoFar,
+    this.dailySalary,
+    this.payableDays,
+    this.expectedDays,
+    this.attendanceDays,
   });
 
   final int year;
@@ -562,6 +616,36 @@ class PayrollInfo {
   final double estimatedNet;
   final bool isEstimate;
   final List<PayDay> days; // newest first
+
+  // Optional extras from the server (period + progress through the month).
+  final DateTime? periodStart;
+  final DateTime? periodEnd;
+  final int? workingDays;
+  final double? elapsedWorkingDays;
+  final double? earnedSoFar;
+  final double? dailySalary;
+  final int? payableDays; // working days that are paid (holidays excluded)
+  final int? expectedDays; // past working days the person was expected to attend
+  final int? attendanceDays; // of those, days with a check-in
+
+  DateTime get start => periodStart ?? DateTime(year, month, 1);
+  DateTime get end => periodEnd ?? DateTime(year, month + 1, 0);
+
+  /// 0..1 — how far through the pay period we are.
+  double get progress {
+    if (!isEstimate) return 1;
+    final w = workingDays;
+    final e = elapsedWorkingDays;
+    if (w != null && w > 0 && e != null) return (e / w).clamp(0.0, 1.0).toDouble();
+    final dim = DateTime(year, month + 1, 0).day;
+    return (DateTime.now().day / dim).clamp(0.0, 1.0).toDouble();
+  }
+
+  /// What the person has earned so far this month (after deductions).
+  double get earnedNow {
+    final v = earnedSoFar ?? (monthlySalary * progress - totalDeduction);
+    return v < 0 ? 0 : v;
+  }
 
   double get totalDeduction => latenessDeduction + absenceDeduction;
 
@@ -578,10 +662,14 @@ class PayrollInfo {
   factory PayrollInfo.fromJson(Map<String, dynamic> j) {
     final now = DateTime.now();
     final key = (j['key']?.toString() ?? '').split('-');
-    final s = _m(j['summary']);
-    final salary = _d(s['monthly_salary']) ?? _d(j['monthly_salary']) ?? 0;
-    final lateDed = _d(s['lateness_deduction']) ?? 0;
-    final absDed = _d(s['absence_deduction']) ?? 0;
+
+    // Summary can live under "summary" or directly on the payroll object.
+    var s = _m(j['summary']);
+    if (s.isEmpty) s = j;
+
+    final salary = _d(_first(s, ['monthly_salary', 'salary', 'base_salary', 'gross_salary'])) ??
+        _d(_first(j, ['monthly_salary', 'salary', 'base_salary', 'gross_salary'])) ??
+        0;
     final estimate = _b(s['is_estimate']) ?? true;
 
     final days = <PayDay>[];
@@ -595,9 +683,34 @@ class PayrollInfo {
         shifts.add(PayShift.fromJson(_m(rawShifts[k]), k + 1, estimate));
       }
       shifts.sort((a, b) => a.number.compareTo(b.number));
-      if (shifts.isNotEmpty) days.add(PayDay(date: date, shifts: shifts));
+      if (shifts.isNotEmpty) days.add(PayDay(date: date, shifts: shifts, holidayName: _s(dj['holiday'])));
     }
     days.sort((a, b) => b.date.compareTo(a.date));
+
+    // Fallbacks computed from the day list when the summary is missing a field.
+    int sumLateMin = 0;
+    double sumLateDed = 0;
+    double sumAbsDed = 0;
+    int absentDays = 0;
+    for (final d in days) {
+      bool hadUnexcused = false;
+      for (final sh in d.shifts) {
+        if (sh.kind == PayKind.late) {
+          sumLateMin += sh.lateMin;
+          sumLateDed += sh.deduction;
+        } else if (sh.kind == PayKind.unexcused) {
+          sumAbsDed += sh.deduction;
+          hadUnexcused = true;
+        }
+      }
+      if (hadUnexcused) absentDays++;
+    }
+
+    final lateDed = _d(s['lateness_deduction']) ?? sumLateDed;
+    final absDed = _d(s['absence_deduction']) ?? sumAbsDed;
+
+    final pStart = _dateOrNull(s['period_start']);
+    final pEnd = _dateOrNull(s['period_end']);
 
     return PayrollInfo(
       year: key.length == 2 ? int.tryParse(key[0]) ?? now.year : now.year,
@@ -605,13 +718,22 @@ class PayrollInfo {
       currency: _s(s['currency']) ?? _s(j['currency']) ?? 'USD',
       monthlySalary: salary,
       graceMinutes: _i(s['grace_minutes']) ?? 5,
-      lateMinutes: _i(s['late_minutes']) ?? 0,
+      lateMinutes: _i(_first(s, ['late_minutes', 'total_late_minutes'])) ?? sumLateMin,
       latenessDeduction: lateDed,
-      unexcusedAbsentDays: _i(s['unexcused_absent_days']) ?? 0,
+      unexcusedAbsentDays: _i(s['unexcused_absent_days']) ?? absentDays,
       absenceDeduction: absDed,
       estimatedNet: _d(s['estimated_net']) ?? (salary - lateDed - absDed),
       isEstimate: estimate,
       days: days,
+      periodStart: pStart,
+      periodEnd: pEnd,
+      workingDays: _i(s['working_days']),
+      elapsedWorkingDays: _d(s['elapsed_working_days']),
+      earnedSoFar: _d(s['earned_so_far']),
+      dailySalary: _d(s['daily_salary']),
+      payableDays: _i(s['payable_days']),
+      expectedDays: _i(s['expected_days']),
+      attendanceDays: _i(s['attendance_days']),
     );
   }
 }
@@ -619,6 +741,157 @@ class PayrollInfo {
 // ════════════════════════════════════════════════════════════════════
 //  MODELS · HOME
 // ════════════════════════════════════════════════════════════════════
+/// The server sends one pay row per scheduled shift, so the full shift schedule
+/// can be read from the statement.
+List<ShiftDef> _scheduleFromPayroll(PayrollInfo? p) {
+  if (p == null || p.days.isEmpty) return const [];
+  PayDay best = p.days.first;
+  for (final d in p.days) {
+    if (d.shifts.length > best.shifts.length) best = d;
+  }
+  return [
+    for (final s in best.shifts)
+      ShiftDef(number: s.number, startMin: s.schedStartMin, endMin: s.schedEndMin),
+  ];
+}
+
+TodayState _stateOfPayShift(PayShift s) {
+  switch (s.kind) {
+    case PayKind.onTime:
+      if (s.inMin == null) return TodayState.notCheckedIn;
+      return s.outMin != null ? TodayState.checkedOut : TodayState.checkedIn;
+    case PayKind.late:
+      return s.outMin != null ? TodayState.checkedOut : TodayState.late;
+    case PayKind.unexcused:
+      return TodayState.absent;
+    case PayKind.leave:
+      return TodayState.leave;
+    case PayKind.sick:
+      return TodayState.sick;
+    case PayKind.holiday:
+      return TodayState.holiday;
+    case PayKind.future:
+      return TodayState.notCheckedIn;
+  }
+}
+
+/// Today per shift (multi-shift staff) and leave / sick / holiday days, read from
+/// today's row of the pay statement. Single-shift staff keep the server's own view.
+TodayInfo _todayFromPayroll(TodayInfo base, PayrollInfo? pay, DateTime serverDate) {
+  if (pay == null) return base;
+  final today = dayOnly(serverDate);
+  PayDay? day;
+  for (final d in pay.days) {
+    if (dayOnly(d.date) == today) {
+      day = d;
+      break;
+    }
+  }
+  if (day == null || day.shifts.isEmpty) return base;
+
+  final shifts = [
+    for (final s in day.shifts)
+      TodayShift(
+        number: s.number,
+        startMin: s.schedStartMin,
+        endMin: s.schedEndMin,
+        state: _stateOfPayShift(s),
+        inMin: s.inMin,
+        outMin: s.outMin,
+        lateMin: s.lateMin,
+        note: s.note,
+      ),
+  ];
+
+  bool allAre(TodayState t) => shifts.every((x) => x.state == t);
+
+  // A full day off always wins (blocks check-in + shows the banner).
+  for (final t in const [TodayState.holiday, TodayState.leave, TodayState.sick]) {
+    if (allAre(t)) {
+      return TodayInfo(
+        state: t,
+        inMin: null,
+        outMin: null,
+        lateMin: 0,
+        note: shifts.first.note ?? base.note,
+        shifts: shifts,
+      );
+    }
+  }
+
+  if (shifts.length == 1) return base;
+
+  final attended = shifts
+      .where((x) =>
+  x.state == TodayState.checkedIn || x.state == TodayState.late || x.state == TodayState.checkedOut)
+      .toList();
+
+  final TodayState state;
+  if (attended.isNotEmpty) {
+    if (attended.any((x) => x.lateMin > 0)) {
+      state = TodayState.late;
+    } else if (attended.every((x) => x.state == TodayState.checkedOut)) {
+      state = TodayState.checkedOut;
+    } else {
+      state = TodayState.checkedIn;
+    }
+  } else if (allAre(TodayState.absent)) {
+    state = TodayState.absent;
+  } else {
+    state = TodayState.notCheckedIn;
+  }
+
+  return TodayInfo(
+    state: state,
+    inMin: attended.isEmpty ? null : attended.first.inMin,
+    outMin: attended.isEmpty ? null : attended.last.outMin,
+    lateMin: attended.fold<int>(0, (a, x) => x.lateMin > a ? x.lateMin : a),
+    note: base.note,
+    shifts: shifts,
+  );
+}
+
+/// Upcoming holidays and the current / next approved leave, from the pay statement.
+TimeOffInfo _timeOffFromPayroll(PayrollInfo? pay, DateTime serverDate) {
+  if (pay == null) return TimeOffInfo.empty;
+  final today = dayOnly(serverDate);
+  final asc = [...pay.days]..sort((a, b) => a.date.compareTo(b.date));
+
+  final holidays = <Holiday>[
+    for (final d in asc)
+      if (d.holidayName != null && !dayOnly(d.date).isBefore(today))
+        Holiday(date: dayOnly(d.date), name: d.holidayName!),
+  ];
+
+  // Runs of consecutive leave / sick days.
+  final runs = <List<PayDay>>[];
+  var cur = <PayDay>[];
+  for (final d in asc) {
+    final off = d.shifts.isNotEmpty &&
+        d.shifts.every((x) => x.kind == PayKind.leave || x.kind == PayKind.sick);
+    if (off) {
+      cur.add(d);
+    } else if (cur.isNotEmpty) {
+      runs.add(cur);
+      cur = <PayDay>[];
+    }
+  }
+  if (cur.isNotEmpty) runs.add(cur);
+
+  LeaveSpan? leave;
+  for (final r in runs) {
+    final end = dayOnly(r.last.date);
+    if (end.isBefore(today)) continue;
+    leave = LeaveSpan(
+      type: r.first.shifts.first.kind == PayKind.sick ? 'sick' : 'other',
+      start: dayOnly(r.first.date),
+      end: end,
+    );
+    break;
+  }
+  return TimeOffInfo(holidays: holidays, leave: leave);
+}
+
 class HomeData {
   const HomeData({
     required this.firstName,
@@ -654,10 +927,29 @@ class HomeData {
   /// The payroll card only exists for staff with a salary.
   bool get hasPayroll => payroll != null && payroll!.monthlySalary > 0;
 
+  HomeData withPayroll(PayrollInfo? p) => HomeData(
+    firstName: firstName,
+    fullName: fullName,
+    jobTitle: jobTitle,
+    branchName: branchName,
+    serverDate: serverDate,
+    shifts: shifts,
+    today: today,
+    month: month,
+    chart: chart,
+    recent: recent,
+    timeOff: timeOff,
+    payroll: p,
+  );
+
   factory HomeData.fromJson(Map<String, dynamic> j) {
     final g = _m(j['greeting']);
     final chart = _m(j['chart']);
-    final timeOff = j['time_off'] is Map ? TimeOffInfo.fromJson(_m(j['time_off'])) : TimeOffInfo.empty;
+    final payroll = j['payroll'] is Map ? PayrollInfo.fromJson(_m(j['payroll'])) : null;
+    final serverDate = _date(j['server_date']);
+    final timeOff = j['time_off'] is Map
+        ? TimeOffInfo.fromJson(_m(j['time_off']))
+        : _timeOffFromPayroll(payroll, serverDate);
 
     // Schedule: new `shifts` list, or the legacy single `shift` object.
     final schedule = <ShiftDef>[];
@@ -665,6 +957,7 @@ class HomeData {
     for (int k = 0; k < rawShifts.length; k++) {
       schedule.add(ShiftDef.fromJson(_m(rawShifts[k]), k + 1));
     }
+    if (schedule.isEmpty) schedule.addAll(_scheduleFromPayroll(payroll));
     if (schedule.isEmpty) {
       final shift = _m(j['shift']);
       schedule.add(ShiftDef(
@@ -675,26 +968,30 @@ class HomeData {
     }
     schedule.sort((a, b) => a.number.compareTo(b.number));
 
+    final todayJson = _m(j['today']);
+    var today = TodayInfo.fromJson(todayJson, schedule);
+    if (_l(todayJson['shifts']).isEmpty) today = _todayFromPayroll(today, payroll, serverDate);
+
     return HomeData(
       firstName: _s(g['first_name']) ?? '',
       fullName: _s(g['full_name']) ?? '',
       jobTitle: _s(g['job_title']) ?? '',
       branchName: _s(g['branch_name']) ?? '',
-      serverDate: _date(j['server_date']),
+      serverDate: serverDate,
       shifts: schedule,
-      today: TodayInfo.fromJson(_m(j['today']), schedule),
+      today: today,
       month: MonthData.fromJson(_m(j['month'])),
       chart: [
         for (final d in _l(chart['days']))
           ChartPoint(
             date: _date(_m(d)['date']),
             inMin: _i(_m(d)['check_in_min']),
-            late: _m(d)['late'] == true,
+            late: (_b(_m(d)['late']) ?? false) || (_i(_m(d)['late_min']) ?? 0) > 0,
           ),
       ],
       recent: [for (final r in _l(j['recent'])) AttRecord.fromJson(_m(r))],
       timeOff: timeOff,
-      payroll: j['payroll'] is Map ? PayrollInfo.fromJson(_m(j['payroll'])) : null,
+      payroll: payroll,
     );
   }
 }
@@ -733,7 +1030,19 @@ class HomeDataService {
     final future = () async {
       try {
         final json = await AuthService.instance.callFunction(_function, {'scope': 'all'});
-        final data = HomeData.fromJson(json);
+        debugPrint('📨 Home keys: ${json.keys.toList()} · payroll=${json['payroll'] is Map ? 'present' : 'MISSING'}');
+        var data = HomeData.fromJson(json);
+
+        // The server could not calculate pay on the home call → ask the payroll scope once.
+        if (data.payroll == null) {
+          debugPrint('💰 Home response had no payroll, asking the payroll scope…');
+          try {
+            final pay = await loadPayroll(data.month.year, data.month.month, forceRefresh: true);
+            data = data.withPayroll(pay);
+          } catch (e) {
+            debugPrint('⚠️ Payroll fallback failed: $e');
+          }
+        }
 
         // Seed the caches so the first open of each sheet is instant.
         _monthCache[_key(data.month.year, data.month.month)] =
@@ -825,7 +1134,7 @@ class HomeDataService {
         final data = PayrollInfo.fromJson(_m(json['payroll']));
         _payrollCache[key] = _CachedPayroll(data, DateTime.now());
         debugPrint('✅ Payroll $key loaded in ${sw.elapsedMilliseconds}ms · '
-            '${data.days.length} days · deductions=${data.totalDeduction}');
+            '${data.days.length} days · salary=${data.monthlySalary} · deductions=${data.totalDeduction}');
         return data;
       } catch (e) {
         debugPrint('❌ Payroll $key failed: $e');
