@@ -161,6 +161,8 @@ class _ScanPageState extends State<ScanPage>
     }
   }
 
+
+
   // ───────────── scanner helpers ─────────────
   MobileScannerController _newScanner() => MobileScannerController(
     detectionSpeed: DetectionSpeed.noDuplicates,
