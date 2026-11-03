@@ -1,6 +1,8 @@
 // lib/Services/ScanService.dart
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io' show Platform;
+import 'dart:typed_data';
 
 import 'package:flutter/foundation.dart';
 import 'package:location/location.dart' as gps;
@@ -11,6 +13,9 @@ import '../Auth/AuthService.dart';
 import 'BiometrricService.dart';
 
 enum CheckinAction { checkIn, checkOut, done }
+
+/// How THIS staff member proves it is them. Decided by the database (staff.check_in_method).
+enum CheckInMethod { biometric, selfie }
 
 class DeviceFacts {
   const DeviceFacts({
@@ -48,6 +53,7 @@ class ScanContextInfo {
     required this.branchName,
     required this.distanceM,
     required this.radiusM,
+    this.method = CheckInMethod.biometric,
     this.shiftNumber,
     this.shiftTotal = 1,
     this.shiftStartMin,
@@ -59,6 +65,7 @@ class ScanContextInfo {
   final String branchName;
   final int distanceM;
   final int radiusM;
+  final CheckInMethod method;
   final int? shiftNumber;
   final int shiftTotal;
   final int? shiftStartMin;
@@ -135,13 +142,49 @@ class ScanService {
   /// scanned, the biometric is asked for again.
   static const Duration _proofMaxAge = Duration(seconds: 40);
 
+  /// A selfie taken in this scan session stays valid for a few minutes
+  /// (so a mistyped / expired QR does not force a new selfie).
+  static const Duration _selfieMaxAge = Duration(minutes: 5);
+
   static const int _wifiReadAttempts = 3;
   static const Duration _wifiRetryDelay = Duration(milliseconds: 400);
 
   BioProof? _proof;
+  Uint8List? _selfie;
+  DateTime? _selfieAt;
 
-  /// 'fingerprint' | 'face' (set at the start of every preflight, read by the UI).
+  /// 'fingerprint' | 'face' (set at the start of every biometric preflight, read by the UI).
   String? lastBioType;
+
+  /// Last method the server told us.
+  CheckInMethod? lastMethod;
+
+  // ───────────── check-in method (from the database) ─────────────
+  /// Asks the server how THIS staff member checks in. Always fresh: HR can change it any time.
+  Future<CheckInMethod> fetchMethod() async {
+    final json = await AuthService.instance.callFunction('checkin', {'action': 'method'});
+    final m = json['check_in_method']?.toString() == 'selfie' ? CheckInMethod.selfie : CheckInMethod.biometric;
+    lastMethod = m;
+    debugPrint('🧭 Check-in method → ${m.name}');
+    return m;
+  }
+
+  // ───────────── selfie ─────────────
+  bool get hasFreshSelfie {
+    final at = _selfieAt;
+    return _selfie != null && at != null && DateTime.now().difference(at) <= _selfieMaxAge;
+  }
+
+  void setSelfie(Uint8List jpeg) {
+    _selfie = jpeg;
+    _selfieAt = DateTime.now();
+    debugPrint('🤳 Selfie ready (${(jpeg.length / 1024).round()} KB)');
+  }
+
+  void clearSelfie() {
+    _selfie = null;
+    _selfieAt = null;
+  }
 
   // ───────────── Wi-Fi helpers ─────────────
   /// Uppercase, ':' separators, every part padded to 2 digits (iOS drops leading zeros,
@@ -355,17 +398,29 @@ class ScanService {
   Future<void> openAppSettings() => ph.openAppSettings();
 
   // ───────────── diagnostics (long-press the title on the scan screen) ─────────────
-  /// Prints BSSID, GPS and biometric type: used for the real-iPhone test at the office.
+  /// Prints BSSID, GPS and check-in method: used for the real-iPhone test at the office.
   Future<Map<String, String>> diagnostics() async {
     final out = <String, String>{};
     out['Platform'] = Platform.isIOS ? 'iOS' : 'Android';
+
+    CheckInMethod? method;
     try {
-      final bio = await BiometricService.instance.localStatus();
-      out['Biometric'] = '${bio.type} (${bio.reason})';
-      out['Strong biometric enrolled'] = '${bio.available}';
-      out['Key exists / valid'] = '${bio.keyExists} / ${bio.keyValid}';
+      method = await fetchMethod();
+      out['Check-in method'] = method.name;
     } catch (e) {
-      out['Biometric'] = 'error: $e';
+      out['Check-in method'] = 'error: $e';
+    }
+
+    // Biometric details only matter (and are only shown) for biometric staff.
+    if (method != CheckInMethod.selfie) {
+      try {
+        final bio = await BiometricService.instance.localStatus();
+        out['Biometric'] = '${bio.type} (${bio.reason})';
+        out['Strong biometric enrolled'] = '${bio.available}';
+        out['Key exists / valid'] = '${bio.keyExists} / ${bio.keyValid}';
+      } catch (e) {
+        out['Biometric'] = 'error: $e';
+      }
     }
 
     // Wi-Fi first, so it shows even when GPS fails.
@@ -399,18 +454,27 @@ class ScanService {
     return status;
   }
 
-  // ───────────── before the camera: biometric available, right place, then the biometric ─────────────
-  /// [onBiometric] fires right before the biometric prompt so the UI can show
-  /// "Scan your fingerprint" or "Look at your phone (Face ID)".
+  // ───────────── before the camera ─────────────
+  /// 1. Ask the database which method this staff member uses.
+  /// 2. Biometric staff: strong biometric must exist on the phone.
+  /// 3. Everyone: right place (GPS + Wi-Fi) is checked by the server.
+  /// 4. Biometric staff: prompt now. Selfie staff: the UI opens the selfie page next.
+  ///
+  /// [onBiometric] fires right before the biometric prompt (biometric staff only).
   Future<ScanContextInfo> preflight({void Function(String type)? onBiometric}) async {
     _proof = null;
+    clearSelfie();
     debugPrint('🚦 Preflight started');
 
-    // 0. No strong biometric on the phone → block immediately (no GPS, no network).
-    final bio = await BiometricService.instance.localStatus();
-    lastBioType = bio.type == 'face' ? 'face' : 'fingerprint';
-    if (!bio.available) {
-      throw AuthFailure('NO_BIOMETRIC_ENROLLED', BioText.setupRequired);
+    final method = await fetchMethod();
+
+    // Biometric staff only: no strong biometric on the phone → block immediately (no GPS, no network).
+    if (method == CheckInMethod.biometric) {
+      final bio = await BiometricService.instance.localStatus();
+      lastBioType = bio.type == 'face' ? 'face' : 'fingerprint';
+      if (!bio.available) {
+        throw AuthFailure('NO_BIOMETRIC_ENROLLED', BioText.setupRequired);
+      }
     }
 
     final facts = await collectFacts();
@@ -433,6 +497,7 @@ class ScanService {
     }
     final ctx = ScanContextInfo(
       next: next,
+      method: method,
       branchName: json['branch_name']?.toString() ?? '',
       distanceM: _int(json['distance_m']) ?? 0,
       radiusM: _int(json['radius_m']) ?? 0,
@@ -442,12 +507,12 @@ class ScanService {
       shiftEndMin: _int(json['shift_end_min']),
       shiftsDone: _int(json['shifts_done']) ?? 0,
     );
-    debugPrint('🚦✅ Preflight OK → next=$next shift=${ctx.shiftNumber}/${ctx.shiftTotal} '
+    debugPrint('🚦✅ Preflight OK → method=${method.name} next=$next shift=${ctx.shiftNumber}/${ctx.shiftTotal} '
         'branch=${ctx.branchName} dist=${ctx.distanceM}m/${ctx.radiusM}m');
 
-    // Place is fine: now the biometric, BEFORE the camera opens.
-    if (next != CheckinAction.done) {
-      onBiometric?.call(lastBioType!);
+    // Place is fine. Biometric staff prove it is them NOW, before the camera opens.
+    if (next != CheckinAction.done && method == CheckInMethod.biometric) {
+      onBiometric?.call(lastBioType ?? 'fingerprint');
       _proof = await BiometricService.instance.proveIdentity(
         subtitle: next == CheckinAction.checkOut ? 'Confirm to check out' : 'Confirm to check in',
       );
@@ -484,15 +549,29 @@ class ScanService {
 
   // ───────────── scan → check-in / check-out ─────────────
   Future<CheckinResult> submit(QrPayload qr, DeviceFacts facts) async {
-    // One proof = one attempt (the server burns each challenge).
-    var proof = _proof;
-    _proof = null;
-    if (proof == null || proof.age > _proofMaxAge) {
-      debugPrint('🔐 Proof missing or older than ${_proofMaxAge.inSeconds}s, asking biometric again');
-      proof = await BiometricService.instance.proveIdentity(subtitle: 'Confirm to continue');
+    final method = lastMethod ?? CheckInMethod.biometric;
+    final Map<String, dynamic> proofFields;
+
+    if (method == CheckInMethod.selfie) {
+      // The selfie is the proof. Missing or too old → the UI sends the person back to the selfie page.
+      final shot = _selfie;
+      if (shot == null || !hasFreshSelfie) {
+        clearSelfie();
+        throw AuthFailure('SELFIE_REQUIRED', 'Take a new selfie to continue.');
+      }
+      proofFields = {'selfie_base64': base64Encode(shot)};
+    } else {
+      // One proof = one attempt (the server burns each challenge).
+      var proof = _proof;
+      _proof = null;
+      if (proof == null || proof.age > _proofMaxAge) {
+        debugPrint('🔐 Proof missing or older than ${_proofMaxAge.inSeconds}s, asking biometric again');
+        proof = await BiometricService.instance.proveIdentity(subtitle: 'Confirm to continue');
+      }
+      proofFields = {'challenge_id': proof.challengeId, 'signature': proof.signature};
     }
 
-    debugPrint('📤 Submitting scan → qr=${qr.type} bssid=${facts.wifiBssid} ssid=${facts.wifiSsid}');
+    debugPrint('📤 Submitting scan → method=${method.name} qr=${qr.type} bssid=${facts.wifiBssid}');
     final json = await _checkin({
       'action': 'scan',
       'qr_type': qr.type,
@@ -501,9 +580,11 @@ class ScanService {
       ...facts.toJson(),
       'device_id': await AuthService.instance.deviceId(),
       'device_name': await AuthService.instance.deviceName(),
-      'challenge_id': proof.challengeId,
-      'signature': proof.signature,
+      ...proofFields,
     }, facts);
+
+    // Every scan needs a NEW selfie.
+    clearSelfie();
 
     final result = CheckinResult(
       action: json['action'] == 'check_out' ? CheckinAction.checkOut : CheckinAction.checkIn,

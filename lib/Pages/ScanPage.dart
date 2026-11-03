@@ -2,6 +2,7 @@
 import 'dart:async';
 import 'dart:io' show Platform;
 import 'dart:math' as math;
+import 'dart:typed_data';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -12,6 +13,7 @@ import '../Services/BiometrricService.dart';
 import '../Services/DataService.dart';
 import '../Services/ScanService.dart';
 import 'FingrPrintPage.dart';
+import 'SelviePage.dart';
 
 // ════════════════════════════════════════════════════════════════════
 //  DESIGN TOKENS (same as Home)
@@ -76,10 +78,12 @@ const Set<String> _bioCodes = {
   'ENROLL_NOT_ALLOWED',
 };
 
+const Set<String> _selfieCodes = {'SELFIE_REQUIRED', 'SELFIE_INVALID'};
+
 // ════════════════════════════════════════════════════════════════════
 //  SCAN PAGE
 // ════════════════════════════════════════════════════════════════════
-enum _Phase { checking, biometric, blocked, camera, submitting, result }
+enum _Phase { checking, biometric, selfie, blocked, camera, submitting, result }
 
 class ScanPage extends StatefulWidget {
   const ScanPage({super.key});
@@ -159,10 +163,11 @@ class _ScanPageState extends State<ScanPage>
 
   // ───────────── scanner helpers ─────────────
   MobileScannerController _newScanner() => MobileScannerController(
-    detectionSpeed: DetectionSpeed.normal,
+    detectionSpeed: DetectionSpeed.noDuplicates,
     facing: CameraFacing.back,
     torchEnabled: false,
     formats: const [BarcodeFormat.qrCode],
+    autoStart: true,
   );
 
   void _disposeScannerLater() {
@@ -221,6 +226,14 @@ class _ScanPageState extends State<ScanPage>
         });
         return;
       }
+
+      // Selfie staff: place is already verified → take the selfie BEFORE the QR camera opens.
+      if (ctx.method == CheckInMethod.selfie) {
+        setState(() => _ctx = ctx);
+        final ok = await _captureSelfie();
+        if (!mounted || id != _seq || !ok) return; // closed the camera → "Take your selfie" screen stays
+      }
+
       setState(() {
         _ctx = ctx;
         _scanner = _newScanner();
@@ -242,6 +255,30 @@ class _ScanPageState extends State<ScanPage>
       if (!mounted || id != _seq) return;
       _showBlocked(AuthFailure('UNKNOWN', 'Something went wrong. Please try again.'));
     }
+  }
+
+  /// Opens the selfie page. true = selfie saved in the service, false = person closed it.
+  Future<bool> _captureSelfie() async {
+    if (!mounted) return false;
+    _disposeScannerLater();
+    setState(() {
+      _failure = null;
+      _phase = _Phase.selfie;
+    });
+    final bytes = await Navigator.of(context).push<Uint8List>(
+      MaterialPageRoute<Uint8List>(fullscreenDialog: true, builder: (_) => const SelfieCapturePage()),
+    );
+    if (!mounted || bytes == null) return false;
+    _service.setSelfie(bytes);
+    HapticFeedback.selectionClick();
+    // Let the front camera fully shut down before the QR scanner opens the back camera.
+    await Future.delayed(const Duration(milliseconds: 450));
+    return mounted;
+  }
+
+  /// "Take selfie" button (selfie screen, or after the selfie expired): selfie → QR camera.
+  Future<void> _takeSelfieAndContinue() async {
+    if (await _captureSelfie() && mounted) _rescan();
   }
 
   /// "Phone not approved" → send a request to HR.
@@ -439,6 +476,10 @@ class _ScanPageState extends State<ScanPage>
         return 'Confirm again';
       case 'ENROLL_NOT_ALLOWED':
         return 'Already registered';
+      case 'SELFIE_REQUIRED':
+        return 'Selfie needed';
+      case 'SELFIE_INVALID':
+        return 'Selfie not accepted';
       default:
         return 'Can\'t check in';
     }
@@ -546,6 +587,9 @@ class _ScanPageState extends State<ScanPage>
       case 'BIOMETRIC_FAILED':
       case 'CHALLENGE_EXPIRED':
         return ['Use $bio again', 'Only your fingerprint or face works: no PIN or pattern'];
+      case 'SELFIE_REQUIRED':
+      case 'SELFIE_INVALID':
+        return const ['Take a clear selfie in good light', 'Your selfie will be reviewed'];
       default:
         return const [];
     }
@@ -597,6 +641,20 @@ class _ScanPageState extends State<ScanPage>
           onTitleLongPress: _showDiagnostics,
         );
 
+      case _Phase.selfie:
+        return _StatusView(
+          tone: _C.ink,
+          leading: const Icon(Icons.camera_front_rounded, size: 42, color: _C.ink),
+          title: 'Take your selfie',
+          subtitle: 'A quick selfie is needed before you scan the QR code. It will be reviewed.',
+          primaryLabel: 'Open camera',
+          onPrimary: _takeSelfieAndContinue,
+          secondaryLabel: 'Done',
+          onSecondary: () => _close(),
+          onClose: _close,
+          onTitleLongPress: _showDiagnostics,
+        );
+
       case _Phase.blocked:
         return _buildBlocked();
 
@@ -617,7 +675,9 @@ class _ScanPageState extends State<ScanPage>
     final sent = notApproved && _approvalSent;
 
     Color tone = _blockedTone(code);
-    Widget leading = _bioCodes.contains(code)
+    Widget leading = _selfieCodes.contains(code)
+        ? Icon(Icons.camera_front_rounded, size: 40, color: tone)
+        : _bioCodes.contains(code)
         ? Icon(_bioIcon, size: 42, color: tone)
         : _Hi(_blockedIcon(code), size: 40, color: tone);
     String title = _blockedTitle(code);
@@ -703,6 +763,13 @@ class _ScanPageState extends State<ScanPage>
       case 'ENROLL_NOT_ALLOWED':
         primaryLabel = 'Done';
         primary = () => _close();
+        break;
+      case 'SELFIE_REQUIRED':
+      case 'SELFIE_INVALID':
+        primaryLabel = 'Take selfie';
+        primary = _takeSelfieAndContinue;
+        secondaryLabel = 'Done';
+        secondary = () => _close();
         break;
       default:
         primaryLabel = 'Try again';
@@ -1061,6 +1128,15 @@ class _ScanPageState extends State<ScanPage>
       );
     }
     final ctx = _ctx;
+    if (ctx != null && ctx.method == CheckInMethod.selfie) {
+      return const _Pill(
+        key: ValueKey('selfie_ready'),
+        color: Color(0x8C000000),
+        textColor: Colors.white,
+        icon: Icon(Icons.check_circle_rounded, size: 18, color: Colors.white),
+        text: 'Selfie ready · scan the QR code',
+      );
+    }
     if (ctx != null && ctx.branchName.isNotEmpty) {
       final window = (ctx.isMultiShift && ctx.shiftStartMin != null && ctx.shiftEndMin != null)
           ? '${_fmt(ctx.shiftStartMin!)} – ${_fmt(ctx.shiftEndMin!)}'
@@ -1124,7 +1200,7 @@ class _ScanPageState extends State<ScanPage>
 }
 
 // ════════════════════════════════════════════════════════════════════
-//  STATUS VIEW (checking / biometric / blocked / result / camera error)
+//  STATUS VIEW (checking / biometric / selfie / blocked / result / camera error)
 // ════════════════════════════════════════════════════════════════════
 class _StatusView extends StatelessWidget {
   const _StatusView({
@@ -1326,7 +1402,7 @@ class _PopIn extends StatelessWidget {
 }
 
 // ════════════════════════════════════════════════════════════════════
-//  Bottom pill (hint / recording / branch / shift window)
+//  Bottom pill (hint / recording / selfie ready / branch / shift window)
 // ════════════════════════════════════════════════════════════════════
 class _Pill extends StatelessWidget {
   const _Pill({

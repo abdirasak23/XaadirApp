@@ -8,6 +8,7 @@ import 'package:hugeicons/hugeicons.dart';
 import '../Auth/AuthService.dart';
 import '../Services/BiometrricService.dart';
 import '../Services/DataService.dart';
+import '../Services/ScanService.dart';
 import 'FingrPrintPage.dart';
 import 'ScanPage.dart';
 
@@ -321,6 +322,7 @@ class _HomeScreenState extends State<HomeScreen>
 
   BioGate _bio = BioGate.unknown;
   bool _autoPrompted = false;
+  CheckInMethod? _method;
 
   // Month picker: null → the current month (default).
   static const int _maxMonthsBack = 6;
@@ -364,9 +366,27 @@ class _HomeScreenState extends State<HomeScreen>
     _snap.value = _Snap(data: _data, loading: _loading, error: _error);
   }
 
-  // ───────────── biometrics ─────────────
+  // ───────────── check-in method + biometrics ─────────────
+  Future<CheckInMethod?> _resolveMethod() async {
+    try {
+      final m = await ScanService.instance.fetchMethod();
+      if (mounted) _method = m;
+      return m;
+    } catch (e) {
+      debugPrint('❌ Method fetch error: $e');
+      return null;
+    }
+  }
+
   Future<void> _refreshBio() async {
     try {
+      final method = await _resolveMethod();
+      if (!mounted) return;
+      if (method == CheckInMethod.selfie) {
+        // Selfie staff: no fingerprint banner, no enrollment prompt, ever.
+        setState(() => _bio = BioGate.unknown);
+        return;
+      }
       final g = await BiometricService.instance.gate();
       if (!mounted) return;
       setState(() => _bio = g);
@@ -451,7 +471,9 @@ class _HomeScreenState extends State<HomeScreen>
       return;
     }
 
-    if (_bio != BioGate.active) {
+    final method = _method ?? await _resolveMethod();
+    if (!mounted) return;
+    if (method != CheckInMethod.selfie && _bio != BioGate.active) {
       _autoPrompted = true;
       await _refreshBio();
       if (!mounted) return;
@@ -1378,7 +1400,7 @@ class _UpcomingBadge extends StatelessWidget {
               width: 40,
               height: 40,
               decoration: BoxDecoration(color: _tint(c, 0.2), shape: BoxShape.circle),
-              child: Icon(started ? Icons.fingerprint : Icons.timer_rounded, color: c, size: 22),
+              child: Icon(started ? Icons.qr_code_scanner_rounded : Icons.timer_rounded, color: c, size: 22),
             ),
             const SizedBox(width: 12),
             Expanded(
