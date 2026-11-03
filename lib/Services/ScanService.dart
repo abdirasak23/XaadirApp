@@ -109,9 +109,10 @@ class CheckinResult {
 }
 
 class _WifiInfo {
-  const _WifiInfo({this.bssid, this.ssid});
-  final String? bssid;
+  const _WifiInfo({this.bssid, this.ssid, this.rawBssid});
+  final String? bssid; // normalized
   final String? ssid;
+  final String? rawBssid; // exactly what the phone returned (for diagnostics)
 }
 
 int? _int(dynamic v) {
@@ -143,6 +144,8 @@ class ScanService {
   String? lastBioType;
 
   // ───────────── Wi-Fi helpers ─────────────
+  /// Uppercase, ':' separators, every part padded to 2 digits (iOS drops leading zeros,
+  /// e.g. 3c:64:cf:f1:13:4 → 3C:64:CF:F1:13:04). Returns null for empty/fake values.
   static String? normalizeBssid(String? raw) {
     if (raw == null) return null;
     final cleaned = raw.trim().toUpperCase().replaceAll('-', ':');
@@ -167,15 +170,40 @@ class ScanService {
     return s;
   }
 
+  /// Tells the staff (and you) exactly what the phone read when the Wi-Fi check fails.
+  String _wifiExplain(DeviceFacts f) {
+    if (f.wifiBssid == null) {
+      return Platform.isIOS
+          ? 'The iPhone did not give the Wi-Fi address. Check that Location is "While Using" with Precise Location ON, and that you are connected to the office Wi-Fi.'
+          : 'Could not read the Wi-Fi address. Turn Location ON and connect to the office Wi-Fi.';
+    }
+    return 'This Wi-Fi is not registered for this branch.\n'
+        'Phone read: ${f.wifiSsid ?? 'unknown'}\n${f.wifiBssid}\n'
+        'Tell HR to add this address.';
+  }
+
+  /// Calls `checkin` and, on WIFI_NOT_ALLOWED, replaces the message with what the phone read.
+  Future<Map<String, dynamic>> _checkin(Map<String, dynamic> body, DeviceFacts facts) async {
+    try {
+      return await AuthService.instance.callFunction('checkin', body);
+    } on AuthFailure catch (e) {
+      if (e.code == 'WIFI_NOT_ALLOWED') {
+        debugPrint('📶🚫 Server rejected Wi-Fi → ssid=${facts.wifiSsid} bssid=${facts.wifiBssid}');
+        throw AuthFailure('WIFI_NOT_ALLOWED', _wifiExplain(facts));
+      }
+      rethrow;
+    }
+  }
+
   /// Reads the connected access point. On iOS a null/empty BSSID means: location off,
   /// permission not "While Using", Precise Location off, or the Wi-Fi entitlement is missing.
   Future<_WifiInfo> _readWifi() async {
     final info = NetworkInfo();
     String? bssid;
     String? ssid;
+    String? raw;
 
     // iOS only gives out SSID/BSSID when location is allowed "While Using".
-    // network_info_plus no longer handles this, so permission_handler does.
     if (Platform.isIOS) {
       try {
         var st = await ph.Permission.locationWhenInUse.status;
@@ -191,20 +219,21 @@ class ScanService {
 
     for (int attempt = 1; attempt <= _wifiReadAttempts; attempt++) {
       try {
-        bssid = normalizeBssid(await info.getWifiBSSID());
+        raw = await info.getWifiBSSID();
+        bssid = normalizeBssid(raw);
         ssid = _cleanSsid(await info.getWifiName());
       } catch (e) {
         debugPrint('📶❌ Wi-Fi read attempt $attempt failed: $e');
       }
       if (bssid != null) break;
       if (attempt < _wifiReadAttempts) {
-        debugPrint('📶⏳ BSSID empty on attempt $attempt, retrying…');
+        debugPrint('📶⏳ BSSID empty on attempt $attempt (raw=$raw), retrying…');
         await Future.delayed(_wifiRetryDelay);
       }
     }
 
-    debugPrint('📶 Connected Wi-Fi → ssid=$ssid bssid=$bssid');
-    return _WifiInfo(bssid: bssid, ssid: ssid);
+    debugPrint('📶 Connected Wi-Fi → ssid=$ssid raw=$raw bssid=$bssid');
+    return _WifiInfo(bssid: bssid, ssid: ssid, rawBssid: raw);
   }
 
   // ───────────── device facts (location + Wi-Fi) ─────────────
@@ -231,6 +260,14 @@ class ScanService {
     if (perm == gps.PermissionStatus.denied) {
       debugPrint('📍❌ Location permission denied');
       throw AuthFailure('LOCATION_DENIED', 'Allow location access to check in.');
+    }
+    // iOS "Precise Location" OFF → permission is "limited" → the Wi-Fi address comes back null.
+    if (Platform.isIOS && perm == gps.PermissionStatus.grantedLimited) {
+      debugPrint('📍❌ iOS Precise Location is off');
+      throw AuthFailure(
+        'LOCATION_IMPRECISE',
+        'Precise Location is off. Turn it on for Xaadir so the office Wi-Fi can be read.',
+      );
     }
 
     final wifiFuture = _readWifi();
@@ -330,16 +367,19 @@ class ScanService {
     } catch (e) {
       out['Biometric'] = 'error: $e';
     }
+
+    // Wi-Fi first, so it shows even when GPS fails.
+    final w = await _readWifi();
+    out['BSSID raw (as the phone returns it)'] = w.rawBssid ?? 'null';
+    out['BSSID sent to server'] = w.bssid ??
+        'null  → location off / not "While Using" / Precise off / entitlement missing';
+    out['SSID'] = w.ssid ?? 'null';
+
     try {
       final f = await collectFacts();
       out['GPS'] = '${f.lat.toStringAsFixed(6)}, ${f.lng.toStringAsFixed(6)} (±${f.accuracyM.round()} m)';
-      out['BSSID'] = f.wifiBssid ?? 'null  → location off / not "While Using" / Precise off / entitlement missing';
-      out['SSID'] = f.wifiSsid ?? 'null';
     } on AuthFailure catch (e) {
       out['GPS'] = '${e.code}: ${e.message}';
-      final w = await _readWifi();
-      out['BSSID'] = w.bssid ?? 'null';
-      out['SSID'] = w.ssid ?? 'null';
     } catch (e) {
       out['GPS'] = 'error: $e';
     }
@@ -374,11 +414,12 @@ class ScanService {
     }
 
     final facts = await collectFacts();
-    final json = await AuthService.instance.callFunction('checkin', {
+    final json = await _checkin({
       'action': 'preflight',
       ...facts.toJson(),
       'device_id': await AuthService.instance.deviceId(),
-    });
+    }, facts);
+
     final CheckinAction next;
     switch (json['next_action']) {
       case 'check_out':
@@ -452,7 +493,7 @@ class ScanService {
     }
 
     debugPrint('📤 Submitting scan → qr=${qr.type} bssid=${facts.wifiBssid} ssid=${facts.wifiSsid}');
-    final json = await AuthService.instance.callFunction('checkin', {
+    final json = await _checkin({
       'action': 'scan',
       'qr_type': qr.type,
       if (qr.branchId != null) 'branch_id': qr.branchId,
@@ -462,7 +503,8 @@ class ScanService {
       'device_name': await AuthService.instance.deviceName(),
       'challenge_id': proof.challengeId,
       'signature': proof.signature,
-    });
+    }, facts);
+
     final result = CheckinResult(
       action: json['action'] == 'check_out' ? CheckinAction.checkOut : CheckinAction.checkIn,
       message: json['message']?.toString() ?? '',
