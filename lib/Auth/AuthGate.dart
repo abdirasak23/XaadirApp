@@ -127,7 +127,7 @@ class _AuthGateState extends State<AuthGate> {
       case _Phase.login:
         return LoginScreen(notice: _notice);
       case _Phase.changePassword:
-        return const ChangePasswordScreen();
+        return const StaffRecoveryScreen();
       case _Phase.home:
         return const HomeScreen();
       case _Phase.error:

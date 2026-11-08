@@ -1,5 +1,6 @@
 // lib/home_data_service.dart
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:flutter/foundation.dart';
 
@@ -66,11 +67,34 @@ bool? _b(dynamic v) {
 }
 
 Map<String, dynamic> _m(dynamic v) => v is Map ? Map<String, dynamic>.from(v) : <String, dynamic>{};
-List<dynamic> _l(dynamic v) => v is List ? v : const [];
+
+/// List parser that also accepts a JSON string (jsonb sometimes arrives as text).
+List<dynamic> _l(dynamic v) {
+  if (v is List) return v;
+  if (v is String && v.trim().startsWith('[')) {
+    try {
+      final d = jsonDecode(v);
+      if (d is List) return d;
+    } catch (_) {}
+  }
+  return const [];
+}
 
 String? _s(dynamic v) {
   final s = v?.toString().trim() ?? '';
   return s.isEmpty ? null : s;
+}
+
+/// "11:10" or "11:10:00" → minutes since midnight.
+int? _timeMin(dynamic v) {
+  final s = v?.toString().trim();
+  if (s == null || s.isEmpty) return null;
+  final p = s.split(':');
+  if (p.length < 2) return null;
+  final h = int.tryParse(p[0]);
+  final m = int.tryParse(p[1]);
+  if (h == null || m == null) return null;
+  return h * 60 + m;
 }
 
 /// First non-null value among several possible key names.
@@ -95,6 +119,29 @@ DateTime _date(dynamic v) => _dateOrNull(v) ?? dayOnly(DateTime.now());
 
 /// Strips the time part so dates compare cleanly.
 DateTime dayOnly(DateTime d) => DateTime(d.year, d.month, d.day);
+
+/// Database weekday: 0 = Sunday … 6 = Saturday (same as staff.scheduled_shifts.day).
+int dbDay(DateTime d) => d.weekday % 7;
+
+/// Weekday parser. Accepts 0–6 (Sun = 0), 7 (ISO Sunday), numeric strings
+/// ("4") and names ("Thu", "Thursday"). Returns null when it is not a day.
+int? _dayOf(dynamic v) {
+  if (v == null) return null;
+  int? fromNum(num n) {
+    final x = n.toInt();
+    if (x >= 0 && x <= 6) return x;
+    if (x == 7) return 0;
+    return null;
+  }
+
+  if (v is num) return fromNum(v);
+  final s = v.toString().trim().toLowerCase();
+  if (s.isEmpty) return null;
+  final n = num.tryParse(s);
+  if (n != null) return fromNum(n);
+  const names = {'sun': 0, 'mon': 1, 'tue': 2, 'wed': 3, 'thu': 4, 'fri': 5, 'sat': 6};
+  return names[s.length >= 3 ? s.substring(0, 3) : s];
+}
 
 AttStatus _statusOf(dynamic st) {
   switch (st?.toString().toLowerCase()) {
@@ -176,18 +223,24 @@ PayKind _payKindOf(dynamic k) {
 // ════════════════════════════════════════════════════════════════════
 //  MODELS · SHIFTS
 // ════════════════════════════════════════════════════════════════════
-/// One scheduled shift from staff.scheduled_shifts (number is 1-based).
+/// One scheduled shift. [day] is the DB weekday (0 = Sun … 6 = Sat) when the
+/// entry comes from staff.scheduled_shifts; null when the server already
+/// filtered the list for today.
 class ShiftDef {
-  const ShiftDef({required this.number, required this.startMin, required this.endMin});
+  const ShiftDef({required this.number, required this.startMin, required this.endMin, this.day});
 
   final int number;
   final int startMin;
   final int endMin;
+  final int? day;
+
+  ShiftDef withNumber(int n) => ShiftDef(number: n, startMin: startMin, endMin: endMin, day: day);
 
   factory ShiftDef.fromJson(Map<String, dynamic> j, int fallbackNumber) => ShiftDef(
     number: _i(j['number']) ?? _i(j['shift_number']) ?? fallbackNumber,
-    startMin: _i(j['start_min']) ?? 8 * 60,
-    endMin: _i(j['end_min']) ?? 17 * 60,
+    startMin: _i(j['start_min']) ?? _timeMin(j['start']) ?? _timeMin(j['shift_start']) ?? 8 * 60,
+    endMin: _i(j['end_min']) ?? _timeMin(j['end']) ?? _timeMin(j['shift_end']) ?? 17 * 60,
+    day: _dayOf(_first(j, ['day', 'weekday', 'day_of_week', 'dow'])),
   );
 }
 
@@ -347,7 +400,7 @@ class AttRecord {
   final AttSource source;
   final String? note;
   final int shiftNumber; // 1-based
-  final int shiftTotal; // how many shifts that staff has per day
+  final int shiftTotal; // how many shifts that staff has on THAT day
 
   bool get isMultiShift => shiftTotal > 1;
 
@@ -741,16 +794,98 @@ class PayrollInfo {
 // ════════════════════════════════════════════════════════════════════
 //  MODELS · HOME
 // ════════════════════════════════════════════════════════════════════
-/// The server sends one pay row per scheduled shift, so the full shift schedule
-/// can be read from the statement.
-List<ShiftDef> _scheduleFromPayroll(PayrollInfo? p) {
-  if (p == null || p.days.isEmpty) return const [];
-  PayDay best = p.days.first;
-  for (final d in p.days) {
-    if (d.shifts.length > best.shifts.length) best = d;
+
+/// Parses every entry, skipping days marked off. An entry that carries a
+/// `days: [..]` list is expanded into one ShiftDef per weekday.
+List<ShiftDef> _parseSchedule(List<dynamic> raw) {
+  final out = <ShiftDef>[];
+  for (int k = 0; k < raw.length; k++) {
+    final r = _m(raw[k]);
+    if (r.isEmpty) continue;
+    final off = _b(_first(r, ['off', 'is_off', 'day_off'])) ?? false;
+    final enabled = _b(r['enabled']) ?? true;
+    if (off || !enabled) continue;
+
+    final dayList = _l(r['days']);
+    if (dayList.isNotEmpty) {
+      for (final d in dayList) {
+        out.add(ShiftDef.fromJson({...r, 'day': d}, k + 1));
+      }
+    } else {
+      out.add(ShiftDef.fromJson(r, k + 1));
+    }
   }
+  return out;
+}
+
+/// Weekly schedule entries (staff.scheduled_shifts) from whichever place the
+/// server put them. The RAW weekly lists come first because they carry the
+/// weekday; `shifts` comes last because a server that "pre-filters" it often
+/// drops the `day` field, which would make every day look like today.
+/// The first source that actually carries day info wins; otherwise the first
+/// non-empty source is used as-is.
+List<ShiftDef> _scheduleOf(Map<String, dynamic> j) {
+  final candidates = <List<dynamic>>[
+    _l(j['scheduled_shifts']),
+    _l(_m(j['staff'])['scheduled_shifts']),
+    _l(_m(j['schedule'])['scheduled_shifts']),
+    _l(_m(j['schedule'])['shifts']),
+    _l(j['shifts']),
+  ];
+
+  List<ShiftDef>? firstNonEmpty;
+  for (final raw in candidates) {
+    if (raw.isEmpty) continue;
+    final parsed = _parseSchedule(raw);
+    if (parsed.isEmpty) continue;
+    if (parsed.any((s) => s.day != null)) return parsed;
+    firstNonEmpty ??= parsed;
+  }
+  return firstNonEmpty ?? <ShiftDef>[];
+}
+
+/// Only the shifts that belong to [today]'s weekday, sorted by start time and
+/// numbered 1, 2… (a double shift = two entries with the same day).
+/// Entries without a `day` were already filtered by the server and are kept.
+List<ShiftDef> _shiftsForDay(List<ShiftDef> all, DateTime today) {
+  final weekly = all.any((s) => s.day != null);
+  if (!weekly) {
+    final copy = [...all]..sort((a, b) => a.number.compareTo(b.number));
+    return copy;
+  }
+  final wd = dbDay(today);
+  final todays = all.where((s) => s.day == wd).toList()
+    ..sort((a, b) => a.startMin.compareTo(b.startMin));
+  return [for (int k = 0; k < todays.length; k++) todays[k].withNumber(k + 1)];
+}
+
+/// Shifts of today read from the pay statement (one pay row per scheduled shift).
+/// Falls back to the latest row with the same weekday. Never mixes different days.
+/// Only used when the server sent NO weekly schedule at all.
+List<ShiftDef> _scheduleFromPayroll(PayrollInfo? p, DateTime serverDate) {
+  if (p == null || p.days.isEmpty) return const [];
+  final today = dayOnly(serverDate);
+
+  PayDay? pick;
+  for (final d in p.days) {
+    if (dayOnly(d.date) == today) {
+      pick = d;
+      break;
+    }
+  }
+  if (pick == null) {
+    final wd = dbDay(today);
+    for (final d in p.days) {
+      // days are newest first → first match is the latest same-weekday row
+      if (dbDay(d.date) == wd && d.shifts.isNotEmpty) {
+        pick = d;
+        break;
+      }
+    }
+  }
+  if (pick == null) return const [];
   return [
-    for (final s in best.shifts)
+    for (final s in pick.shifts)
       ShiftDef(number: s.number, startMin: s.schedStartMin, endMin: s.schedEndMin),
   ];
 }
@@ -777,8 +912,15 @@ TodayState _stateOfPayShift(PayShift s) {
 
 /// Today per shift (multi-shift staff) and leave / sick / holiday days, read from
 /// today's row of the pay statement. Single-shift staff keep the server's own view.
-TodayInfo _todayFromPayroll(TodayInfo base, PayrollInfo? pay, DateTime serverDate) {
-  if (pay == null) return base;
+/// Only the pay rows that match today's SCHEDULED shifts are used, so a pay
+/// statement that lists every weekday's shifts can never leak into today.
+TodayInfo _todayFromPayroll(
+    TodayInfo base,
+    PayrollInfo? pay,
+    DateTime serverDate,
+    List<ShiftDef> schedule,
+    ) {
+  if (pay == null || schedule.isEmpty) return base;
   final today = dayOnly(serverDate);
   PayDay? day;
   for (final d in pay.days) {
@@ -789,8 +931,13 @@ TodayInfo _todayFromPayroll(TodayInfo base, PayrollInfo? pay, DateTime serverDat
   }
   if (day == null || day.shifts.isEmpty) return base;
 
+  final rows = day.shifts
+      .where((s) => schedule.any((x) => x.startMin == s.schedStartMin && x.endMin == s.schedEndMin))
+      .toList();
+  if (rows.isEmpty) return base;
+
   final shifts = [
-    for (final s in day.shifts)
+    for (final s in rows)
       TodayShift(
         number: s.number,
         startMin: s.schedStartMin,
@@ -905,6 +1052,7 @@ class HomeData {
     required this.chart,
     required this.recent,
     required this.timeOff,
+    this.weekSchedule = const [],
     this.payroll,
   });
 
@@ -913,7 +1061,13 @@ class HomeData {
   final String jobTitle;
   final String branchName;
   final DateTime serverDate;
+
+  /// ONLY today's shifts (0 = day off, 1 = single, 2+ = double/multi).
   final List<ShiftDef> shifts;
+
+  /// The whole weekly schedule (every day), for screens that want to show it.
+  final List<ShiftDef> weekSchedule;
+
   final TodayInfo today;
   final MonthData month;
   final List<ChartPoint> chart;
@@ -934,6 +1088,7 @@ class HomeData {
     branchName: branchName,
     serverDate: serverDate,
     shifts: shifts,
+    weekSchedule: weekSchedule,
     today: today,
     month: month,
     chart: chart,
@@ -951,26 +1106,44 @@ class HomeData {
         ? TimeOffInfo.fromJson(_m(j['time_off']))
         : _timeOffFromPayroll(payroll, serverDate);
 
-    // Schedule: new `shifts` list, or the legacy single `shift` object.
-    final schedule = <ShiftDef>[];
-    final rawShifts = _l(j['shifts']);
-    for (int k = 0; k < rawShifts.length; k++) {
-      schedule.add(ShiftDef.fromJson(_m(rawShifts[k]), k + 1));
-    }
-    if (schedule.isEmpty) schedule.addAll(_scheduleFromPayroll(payroll));
-    if (schedule.isEmpty) {
+    // ── Schedule: keep ONLY the shifts of today's weekday ──────────
+    final all = _scheduleOf(j);
+    final weekly = all.any((s) => s.day != null);
+    final week = weekly
+        ? ([...all]..sort((a, b) {
+      final c = (a.day ?? 0).compareTo(b.day ?? 0);
+      return c != 0 ? c : a.startMin.compareTo(b.startMin);
+    }))
+        : <ShiftDef>[];
+
+    var schedule = _shiftsForDay(all, serverDate);
+
+    // The pay statement is only a fallback when the server sent NO weekly
+    // schedule. With a weekly schedule, an empty day really is a day off.
+    if (schedule.isEmpty && !weekly) schedule = _scheduleFromPayroll(payroll, serverDate);
+
+    // Old backend with a single `shift` object (never for a known day off).
+    if (schedule.isEmpty && !weekly && j['shift'] is Map) {
       final shift = _m(j['shift']);
-      schedule.add(ShiftDef(
-        number: 1,
-        startMin: _i(shift['start_min']) ?? 8 * 60,
-        endMin: _i(shift['end_min']) ?? 17 * 60,
-      ));
+      schedule = [
+        ShiftDef(
+          number: 1,
+          startMin: _i(shift['start_min']) ?? 8 * 60,
+          endMin: _i(shift['end_min']) ?? 17 * 60,
+        ),
+      ];
     }
     schedule.sort((a, b) => a.number.compareTo(b.number));
 
+    debugPrint('📅 Schedule · entries=${all.length} · withDay=${all.where((s) => s.day != null).length} · '
+        'serverDate=${serverDate.toIso8601String().substring(0, 10)} · todayDb=${dbDay(serverDate)} · '
+        'todayShifts=${schedule.length}');
+
     final todayJson = _m(j['today']);
     var today = TodayInfo.fromJson(todayJson, schedule);
-    if (_l(todayJson['shifts']).isEmpty) today = _todayFromPayroll(today, payroll, serverDate);
+    if (_l(todayJson['shifts']).isEmpty) {
+      today = _todayFromPayroll(today, payroll, serverDate, schedule);
+    }
 
     return HomeData(
       firstName: _s(g['first_name']) ?? '',
@@ -979,6 +1152,7 @@ class HomeData {
       branchName: _s(g['branch_name']) ?? '',
       serverDate: serverDate,
       shifts: schedule,
+      weekSchedule: week,
       today: today,
       month: MonthData.fromJson(_m(j['month'])),
       chart: [
@@ -1053,7 +1227,8 @@ class HomeDataService {
         }
 
         debugPrint('✅ Home loaded in ${sw.elapsedMilliseconds}ms · '
-            'today=${data.today.state.name} · shifts=${data.shifts.length} · '
+            'today=${data.today.state.name} · todayShifts=${data.shifts.length} · '
+            'weekEntries=${data.weekSchedule.length} · '
             'holidays=${data.timeOff.holidays.length} · '
             'leave=${data.timeOff.leave?.type ?? 'none'} · '
             'payroll=${data.hasPayroll ? 'yes' : 'no'}');

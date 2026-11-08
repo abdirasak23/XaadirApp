@@ -4,6 +4,7 @@ import 'package:flutter/services.dart';
 import 'package:hugeicons/hugeicons.dart';
 
 import 'AuthService.dart';
+import 'ChangePassword.dart';
 
 const String _logoAsset = 'assets/images/xaadirlogo.png';
 const String _font = 'Poppins'; // must match `family:` in pubspec.yaml
@@ -38,6 +39,7 @@ class _LoginScreenState extends State<LoginScreen> {
   bool _obscure = true;
   bool _loading = false;
   String? _error;
+  String? _info; // shown after a successful password reset
 
   @override
   void dispose() {
@@ -53,6 +55,7 @@ class _LoginScreenState extends State<LoginScreen> {
     setState(() {
       _loading = true;
       _error = null;
+      _info = null;
     });
     try {
       await AuthService.instance.signIn(
@@ -75,8 +78,30 @@ class _LoginScreenState extends State<LoginScreen> {
     }
   }
 
+  Future<void> _openRecovery() async {
+    if (_loading) return;
+    FocusScope.of(context).unfocus();
+    final done = await Navigator.of(context).push<bool>(
+      MaterialPageRoute(
+        builder: (_) => StaffRecoveryScreen(
+          initialEmail: _emailController.text.trim(),
+        ),
+      ),
+    );
+    if (done == true && mounted) {
+      setState(() {
+        _error = null;
+        _info = 'Password reset. Sign in with your new password.';
+        _passwordController.clear();
+      });
+      _passwordFocus.requestFocus();
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
+    final infoMessage = _info ?? widget.notice;
+
     return Scaffold(
       backgroundColor: Colors.white,
       body: SafeArea(
@@ -113,8 +138,8 @@ class _LoginScreenState extends State<LoginScreen> {
                       ),
                     ),
                     const SizedBox(height: 28),
-                    if (widget.notice != null && _error == null) ...[
-                      _Banner(message: widget.notice!, isInfo: true),
+                    if (infoMessage != null && _error == null) ...[
+                      _Banner(message: infoMessage, isInfo: true),
                       const SizedBox(height: 14),
                     ],
                     if (_error != null) ...[
@@ -173,14 +198,26 @@ class _LoginScreenState extends State<LoginScreen> {
                       loading: _loading,
                       onPressed: _submit,
                     ),
-                    const SizedBox(height: 20),
-                    const Text(
-                      'Forgot password? Ask HR to reset it.',
-                      textAlign: TextAlign.center,
-                      style: TextStyle(
-                        fontFamily: _font,
-                        fontSize: 13,
-                        color: _C.muted,
+                    const SizedBox(height: 12),
+                    Center(
+                      child: GestureDetector(
+                        onTap: _loading ? null : _openRecovery,
+                        behavior: HitTestBehavior.opaque,
+                        child: const Padding(
+                          padding:
+                          EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                          child: Text(
+                            'Forgot password?',
+                            textAlign: TextAlign.center,
+                            style: TextStyle(
+                              fontFamily: _font,
+                              fontSize: 13,
+                              fontWeight: FontWeight.w600,
+                              color: _C.primary,
+                              decoration: TextDecoration.underline,
+                            ),
+                          ),
+                        ),
                       ),
                     ),
                   ],

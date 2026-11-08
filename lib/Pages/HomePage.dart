@@ -97,6 +97,13 @@ const _monthsFull = [
   'July', 'August', 'September', 'October', 'November', 'December'
 ];
 
+/// Indexed by DB weekday: 0 = Sunday … 6 = Saturday.
+const _dbDayShort = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+const _dbDayLong = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+
+/// Week display order, Monday first.
+const _weekOrder = [1, 2, 3, 4, 5, 6, 0];
+
 String fmtMin(int m) {
   final h24 = (m ~/ 60) % 24;
   final mm = m % 60;
@@ -179,6 +186,107 @@ String _leaveLabel(String type) {
 
 String _range(DateTime a, DateTime b) =>
     dayOnly(a) == dayOnly(b) ? fmtDate(a) : '${fmtDate(a)} – ${fmtDate(b)}';
+
+// ════════════════════════════════════════════════════════════════════
+//  TODAY'S SHIFTS ONLY (never mixes other weekdays)
+// ════════════════════════════════════════════════════════════════════
+
+/// The shifts that belong to TODAY, nothing else.
+/// - Uses HomeData.shifts (already today-only) as the source of truth.
+/// - Drops any server row that is not one of today's scheduled shifts.
+/// - Removes duplicates, sorts by start time and numbers them 1, 2…
+/// - Empty list → day off.
+List<TodayShift> _todayShifts(HomeData d) {
+  final sched = d.shifts;
+  if (sched.isEmpty) return const [];
+
+  final out = <TodayShift>[];
+  final seen = <String>{};
+
+  for (final s in d.today.shifts) {
+    final belongs = sched.any((x) => x.startMin == s.startMin && x.endMin == s.endMin);
+    if (!belongs) continue;
+    if (!seen.add('${s.startMin}-${s.endMin}')) continue;
+    out.add(s);
+  }
+
+  // Scheduled for today but the server sent no row yet → waiting for check-in.
+  for (final x in sched) {
+    if (seen.add('${x.startMin}-${x.endMin}')) {
+      out.add(TodayShift(
+        number: x.number,
+        startMin: x.startMin,
+        endMin: x.endMin,
+        state: TodayState.notCheckedIn,
+      ));
+    }
+  }
+
+  out.sort((a, b) => a.startMin.compareTo(b.startMin));
+  return [
+    for (int i = 0; i < out.length; i++)
+      TodayShift(
+        number: i + 1,
+        startMin: out[i].startMin,
+        endMin: out[i].endMin,
+        state: out[i].state,
+        inMin: out[i].inMin,
+        outMin: out[i].outMin,
+        lateMin: out[i].lateMin,
+        note: out[i].note,
+      ),
+  ];
+}
+
+/// Day-level info that agrees with the shifts we actually show.
+TodayInfo _effectiveToday(HomeData d, List<TodayShift> shifts) {
+  final base = d.today;
+  if (shifts.length == 1 && base.shifts.length != 1) {
+    final s = shifts.first;
+    return TodayInfo(
+      state: s.state,
+      inMin: s.inMin,
+      outMin: s.outMin,
+      lateMin: s.lateMin,
+      note: s.note ?? base.note,
+      shifts: shifts,
+    );
+  }
+  return TodayInfo(
+    state: base.state,
+    inMin: base.inMin,
+    outMin: base.outMin,
+    lateMin: base.lateMin,
+    note: base.note,
+    shifts: shifts,
+  );
+}
+
+/// Shifts of one DB weekday from the weekly schedule, sorted by start.
+List<ShiftDef> _weekDayShifts(HomeData d, int day) {
+  final list = d.weekSchedule.where((s) => s.day == day).toList()
+    ..sort((a, b) => a.startMin.compareTo(b.startMin));
+  return list;
+}
+
+class _NextShift {
+  const _NextShift(this.daysAhead, this.dbDay, this.shifts);
+  final int daysAhead;
+  final int dbDay;
+  final List<ShiftDef> shifts;
+}
+
+/// The next day (after today) that has at least one shift.
+_NextShift? _nextShiftOf(HomeData d) {
+  if (d.weekSchedule.isEmpty) return null;
+  final todayDb = d.serverDate.weekday % 7;
+  for (int i = 1; i <= 7; i++) {
+    final day = (todayDb + i) % 7;
+    final s = _weekDayShifts(d, day);
+    if (s.isNotEmpty) return _NextShift(i, day, s);
+  }
+  return null;
+}
 
 // ════════════════════════════════════════════════════════════════════
 //  TIME-OFF BANNER MODEL (holiday / leave / sick / upcoming)
@@ -419,7 +527,7 @@ class _HomeScreenState extends State<HomeScreen>
     try {
       final d = await _service.load();
       if (!mounted || id != _seq) return;
-      debugPrint('✅ Home loaded · today=${d.today.state.name} · shifts=${d.shifts.length}');
+      debugPrint('✅ Home loaded · today=${d.today.state.name} · todayShifts=${d.shifts.length}');
       _set(() {
         _data = d;
         _loading = false;
@@ -468,6 +576,13 @@ class _HomeScreenState extends State<HomeScreen>
     if (blocked != null) {
       debugPrint('⛔ Scan blocked · ${_data!.today.state.name}');
       _toast(blocked);
+      return;
+    }
+
+    // Day off: nothing is scheduled today.
+    if (_data != null && _data!.shifts.isEmpty) {
+      debugPrint('⛔ Scan blocked · no shift scheduled today');
+      _toast('You have no shift today.');
       return;
     }
 
@@ -1272,7 +1387,7 @@ class _MonthRow extends StatelessWidget {
 }
 
 // ════════════════════════════════════════════════════════════════════
-//  TODAY SECTION  (upcoming-shift badge + pill / multi-shift timeline)
+//  TODAY SECTION  (day-off card / upcoming badge + pill / timeline)
 // ════════════════════════════════════════════════════════════════════
 class _BadgeInfo {
   const _BadgeInfo(this.shift, this.secsToStart);
@@ -1318,7 +1433,7 @@ class _TodaySectionState extends State<_TodaySection> {
   }
 
   /// Picks the shift to announce: a started shift waiting for check-in wins,
-  /// otherwise the next upcoming shift of the day (no 1-hour limit anymore).
+  /// otherwise the next upcoming shift of the day.
   _BadgeInfo? _badgeFor(List<TodayShift> shifts, int nowMin, int nowSec) {
     TodayShift? next;
     for (final s in shifts) {
@@ -1335,7 +1450,15 @@ class _TodaySectionState extends State<_TodaySection> {
   @override
   Widget build(BuildContext context) {
     final d = widget.data;
-    final info = d.today;
+
+    // Only TODAY's shifts. Empty → day off.
+    final shifts = _todayShifts(d);
+    if (shifts.isEmpty) {
+      return _DayOffCard(next: _nextShiftOf(d));
+    }
+
+    final info = _effectiveToday(d, shifts);
+    final multi = shifts.length > 1;
 
     // Always use the device clock so the countdown never disappears
     // because of a server/device date mismatch.
@@ -1343,7 +1466,7 @@ class _TodaySectionState extends State<_TodaySection> {
     final nowMin = now.hour * 60 + now.minute;
     final nowSec = now.hour * 3600 + now.minute * 60 + now.second;
 
-    final badge = _badgeFor(info.shifts, nowMin, nowSec);
+    final badge = _badgeFor(shifts, nowMin, nowSec);
 
     // Tick every second only while a countdown is on screen.
     final want = (badge?.secsToStart != null) ? _fast : _slow;
@@ -1353,14 +1476,73 @@ class _TodaySectionState extends State<_TodaySection> {
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
         if (badge != null) ...[
-          _UpcomingBadge(info: badge, multi: info.isMultiShift),
+          _UpcomingBadge(info: badge, multi: multi),
           const SizedBox(height: 12),
         ],
-        if (info.isMultiShift)
-          _TodayShiftsCard(shifts: info.shifts, nowMin: nowMin)
+        if (multi)
+          _TodayShiftsCard(shifts: shifts, nowMin: nowMin)
         else
           _TodayPill(info: info),
       ],
+    );
+  }
+}
+
+/// Shown when no shift is scheduled for today's weekday.
+class _DayOffCard extends StatelessWidget {
+  const _DayOffCard({required this.next});
+  final _NextShift? next;
+
+  @override
+  Widget build(BuildContext context) {
+    final n = next;
+    String? sub;
+    if (n != null) {
+      final when = n.daysAhead == 1 ? 'Tomorrow' : _dbDayLong[n.dbDay];
+      final times = n.shifts.map((s) => fmtRange(s.startMin, s.endMin)).join('  ·  ');
+      sub = 'Next shift $when · $times';
+    }
+
+    return Semantics(
+      container: true,
+      label: 'Day off today. ${sub ?? ''}',
+      child: Container(
+        width: double.infinity,
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 14),
+        decoration: BoxDecoration(
+          color: _tint(XColors.blue, 0.12),
+          borderRadius: BorderRadius.circular(XRadius.card),
+          border: Border.all(color: _tint(XColors.blue, 0.25)),
+        ),
+        child: Row(
+          children: [
+            Container(
+              width: 44,
+              height: 44,
+              decoration: BoxDecoration(color: _tint(XColors.blue, 0.2), shape: BoxShape.circle),
+              child: const Icon(Icons.weekend_rounded, color: XColors.blue, size: 24),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text('Day off today',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: XText.bodyStrong.copyWith(color: XColors.ink)),
+                  const SizedBox(height: 2),
+                  Text(sub ?? 'No shift is scheduled for today.',
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                      style: XText.caption.copyWith(fontSize: 13)),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
     );
   }
 }
@@ -2818,16 +3000,19 @@ class ProfileSheet extends StatelessWidget {
 
   /// Add more read-only rows here if HomeData has more fields
   /// (phone, role, staff ID...). One line each.
-  List<_InfoRowData> _rows(HomeData d) => [
-    _InfoRowData(XIcons.user, 'Full name', d.fullName),
-    if (email != null && email!.isNotEmpty) _InfoRowData(XIcons.mail, 'Email', email!),
-    if (d.branchName.isNotEmpty) _InfoRowData(XIcons.branch, 'Branch', d.branchName),
-    _InfoRowData(
-      XIcons.clock,
-      d.shifts.length > 1 ? 'Shifts' : 'Shift',
-      d.shifts.map((s) => fmtRange(s.startMin, s.endMin)).join('\n'),
-    ),
-  ];
+  List<_InfoRowData> _rows(HomeData d) {
+    final shifts = _todayShifts(d);
+    final String shiftLabel = shifts.length > 1 ? 'Today\'s shifts' : 'Today\'s shift';
+    final String shiftValue = shifts.isEmpty
+        ? 'Day off'
+        : shifts.map((s) => fmtRange(s.startMin, s.endMin)).join('\n');
+    return [
+      _InfoRowData(XIcons.user, 'Full name', d.fullName),
+      if (email != null && email!.isNotEmpty) _InfoRowData(XIcons.mail, 'Email', email!),
+      if (d.branchName.isNotEmpty) _InfoRowData(XIcons.branch, 'Branch', d.branchName),
+      _InfoRowData(XIcons.clock, shiftLabel, shiftValue),
+    ];
+  }
 
   Future<void> _confirmLogout(BuildContext context) async {
     final ok = await showDialog<bool>(
@@ -3006,6 +3191,12 @@ class ProfileSheet extends StatelessWidget {
             ],
           ),
         ),
+        if (d.weekSchedule.isNotEmpty) ...[
+          const SizedBox(height: 20),
+          const Text('Weekly schedule', style: XText.caption),
+          const SizedBox(height: 8),
+          _WeekCard(data: d),
+        ],
         const SizedBox(height: 14),
         const Row(
           mainAxisAlignment: MainAxisAlignment.center,
@@ -3051,6 +3242,64 @@ class ProfileSheet extends StatelessWidget {
                   style: TextStyle(fontFamily: XText.f, fontWeight: FontWeight.w600)),
             ),
           ),
+        ],
+      ),
+    );
+  }
+}
+
+/// Weekly schedule, Monday first, one row per day. Today is highlighted.
+class _WeekCard extends StatelessWidget {
+  const _WeekCard({required this.data});
+  final HomeData data;
+
+  @override
+  Widget build(BuildContext context) {
+    final todayDb = data.serverDate.weekday % 7;
+
+    return Container(
+      decoration: BoxDecoration(
+        color: XColors.card,
+        borderRadius: BorderRadius.circular(XRadius.card),
+      ),
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+      child: Column(
+        children: [
+          for (int i = 0; i < _weekOrder.length; i++) ...[
+            if (i > 0) const _HDivider(),
+            _weekRow(_weekOrder[i], todayDb),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _weekRow(int day, int todayDb) {
+    final shifts = _weekDayShifts(data, day);
+    final isToday = day == todayDb;
+    final off = shifts.isEmpty;
+
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 12),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          SizedBox(
+            width: 44,
+            child: Text(
+              _dbDayShort[day],
+              style: XText.bodyStrong.copyWith(color: isToday ? XColors.ink : XColors.textDim),
+            ),
+          ),
+          Expanded(
+            child: Text(
+              off ? 'Off' : shifts.map((s) => fmtRange(s.startMin, s.endMin)).join('\n'),
+              style: off
+                  ? XText.body.copyWith(color: XColors.textDim)
+                  : XText.bodyStrong.copyWith(fontSize: 13),
+            ),
+          ),
+          if (isToday) const _Tag('Today', XColors.green),
         ],
       ),
     );

@@ -1,29 +1,23 @@
-// lib/change_password_screen.dart
+// lib/staff_recovery_screen.dart
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:hugeicons/hugeicons.dart';
+
 import 'AuthService.dart';
 
 const String _logoAsset = 'assets/images/xaadirlogo.png';
 const String _font = 'Poppins'; // must match `family:` in pubspec.yaml
 
-
 class _C {
-  static const primary = Color(0xFF000000); // brand black
-  static const ink = Color(0xFF0A0A0A);
-  static const muted = Color(0xFF6B7280);
-  static const border = Color(0xFFE5E7EB);
-  static const fill = Color(0xFFF9FAFB);
+  static const primary = Color(0xFF090808);
+  static const ink = Color(0xFF0F172A);
+  static const muted = Color(0xFF64748B);
+  static const border = Color(0xFFE2E8F0);
+  static const fill = Color(0xFFF8FAFC);
   static const ok = Color(0xFF16A34A);
+  static const okBg = Color(0xFFF0FDF4);
   static const error = Color(0xFFDC2626);
   static const errorBg = Color(0xFFFEF2F2);
-}
-
-class ChangePasswordScreen extends StatefulWidget {
-  const ChangePasswordScreen({super.key});
-
-  @override
-  State<ChangePasswordScreen> createState() => _ChangePasswordScreenState();
 }
 
 class _UpperCaseFormatter extends TextInputFormatter {
@@ -34,23 +28,37 @@ class _UpperCaseFormatter extends TextInputFormatter {
   }
 }
 
-class _ChangePasswordScreenState extends State<ChangePasswordScreen> {
+/// Pops with `true` once the password was reset, so Login can show a message.
+class StaffRecoveryScreen extends StatefulWidget {
+  const StaffRecoveryScreen({super.key, this.initialEmail});
+
+  final String? initialEmail;
+
+  @override
+  State<StaffRecoveryScreen> createState() => _StaffRecoveryScreenState();
+}
+
+class _StaffRecoveryScreenState extends State<StaffRecoveryScreen> {
+  late final TextEditingController _emailController;
   final _codeController = TextEditingController();
   final _newController = TextEditingController();
   final _confirmController = TextEditingController();
 
+  final _codeFocus = FocusNode();
+  final _newFocus = FocusNode();
+  final _confirmFocus = FocusNode();
+
   bool _obscureNew = true;
   bool _obscureConfirm = true;
   bool _loading = false;
+  bool _success = false;
   String? _error;
-
-  // Temporary password is "Xd" + 4 digits (always 6 chars); the server enforces the exact rule.
-  static final RegExp _temporaryPattern =
-  RegExp(r'^xd\d{4}$', caseSensitive: false);
 
   @override
   void initState() {
     super.initState();
+    _emailController = TextEditingController(text: widget.initialEmail ?? '');
+    _emailController.addListener(_refresh);
     _codeController.addListener(_refresh);
     _newController.addListener(_refresh);
     _confirmController.addListener(_refresh);
@@ -58,9 +66,13 @@ class _ChangePasswordScreenState extends State<ChangePasswordScreen> {
 
   @override
   void dispose() {
+    _emailController.dispose();
     _codeController.dispose();
     _newController.dispose();
     _confirmController.dispose();
+    _codeFocus.dispose();
+    _newFocus.dispose();
+    _confirmFocus.dispose();
     super.dispose();
   }
 
@@ -70,51 +82,28 @@ class _ChangePasswordScreenState extends State<ChangePasswordScreen> {
 
   String get _password => _newController.text;
 
-  bool get _hasLength => _password.length >= 8;
-  bool get _hasLetter => RegExp(r'[A-Za-z]').hasMatch(_password);
-  bool get _hasNumber => RegExp(r'[0-9]').hasMatch(_password);
-  bool get _notTemporary =>
-      _password.isNotEmpty && !_temporaryPattern.hasMatch(_password);
+  bool get _emailOk {
+    final e = _emailController.text.trim();
+    return e.contains('@') && e.contains('.');
+  }
+
+  bool get _codeOk => _codeController.text.trim().length >= 6;
+  bool get _hasLength => _password.length >= 12;
+  bool get _hasUpper => RegExp(r'[A-Z]').hasMatch(_password);
+  bool get _hasLower => RegExp(r'[a-z]').hasMatch(_password);
+  bool get _hasNumber => RegExp(r'\d').hasMatch(_password);
   bool get _matches =>
       _password.isNotEmpty && _password == _confirmController.text;
-  bool get _codeComplete => _codeController.text.length == 8;
 
   bool get _canSubmit =>
       !_loading &&
-          _codeComplete &&
+          _emailOk &&
+          _codeOk &&
           _hasLength &&
-          _hasLetter &&
+          _hasUpper &&
+          _hasLower &&
           _hasNumber &&
-          _notTemporary &&
-          _matches &&
-          _password.length <= 72;
-
-  String _messageFor(AuthFailure e) {
-    switch (e.code) {
-      case 'WRONG_CODE':
-        final left = e.attemptsLeft;
-        if (left != null) {
-          return 'Wrong invite code. $left attempt${left == 1 ? '' : 's'} left.';
-        }
-        return 'Wrong invite code.';
-      case 'INVITE_LOCKED':
-        return 'Your invite is locked. Ask HR to resend it.';
-      case 'INVITE_EXPIRED':
-        return 'This invite has expired. Ask HR to send a new one.';
-      case 'NO_INVITE':
-        return 'No active invite. Ask HR to send you an invite code.';
-      case 'WEAK_PASSWORD':
-        return e.message;
-      case 'DEVICE_NOT_APPROVED':
-        return 'This account is linked to another phone. Ask HR for help.';
-      case 'ALREADY_CHANGED':
-        return 'Your password was already changed. Opening the app…';
-      case 'STAFF_INACTIVE':
-        return 'Your account is inactive. Contact HR.';
-      default:
-        return e.message;
-    }
-  }
+          _matches;
 
   Future<void> _submit() async {
     if (!_canSubmit) return;
@@ -124,20 +113,23 @@ class _ChangePasswordScreenState extends State<ChangePasswordScreen> {
       _error = null;
     });
     try {
-      await AuthService.instance.changePassword(
+      await AuthService.instance.resetStaffPassword(
+        email: _emailController.text,
+        code: _codeController.text,
         newPassword: _newController.text,
-        inviteCode: _codeController.text,
+        confirmPassword: _confirmController.text,
       );
-      // Success: re-sign-in fires an auth event and AuthGate opens Home.
+      if (!mounted) return;
+      setState(() {
+        _loading = false;
+        _success = true;
+      });
     } on AuthFailure catch (e) {
       if (!mounted) return;
       setState(() {
-        _error = _messageFor(e);
+        _error = e.message;
         _loading = false;
       });
-      if (e.code == 'ALREADY_CHANGED' || e.code == 'STAFF_INACTIVE') {
-        AuthService.instance.requestRecheck();
-      }
     } catch (_) {
       if (!mounted) return;
       setState(() {
@@ -147,9 +139,9 @@ class _ChangePasswordScreenState extends State<ChangePasswordScreen> {
     }
   }
 
-  Future<void> _signOut() async {
+  void _backToLogin() {
     if (_loading) return;
-    await AuthService.instance.signOut();
+    Navigator.of(context).pop(_success);
   }
 
   Widget _rule(String text, bool ok) {
@@ -198,6 +190,11 @@ class _ChangePasswordScreenState extends State<ChangePasswordScreen> {
   Widget build(BuildContext context) {
     return PopScope(
       canPop: false,
+      onPopInvokedWithResult: (didPop, _) {
+        // System back: leave unless a request is in flight, and still report
+        // success to Login if the reset already went through.
+        if (!didPop) _backToLogin();
+      },
       child: Scaffold(
         backgroundColor: Colors.white,
         body: SafeArea(
@@ -207,140 +204,204 @@ class _ChangePasswordScreenState extends State<ChangePasswordScreen> {
               const EdgeInsets.symmetric(horizontal: 24, vertical: 24),
               child: ConstrainedBox(
                 constraints: const BoxConstraints(maxWidth: 420),
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
-                  children: [
-                    const _Logo(),
-                    const SizedBox(height: 28),
-                    const Text(
-                      'Change password',
-                      textAlign: TextAlign.center,
-                      style: TextStyle(
-                        fontFamily: _font,
-                        fontSize: 28,
-                        fontWeight: FontWeight.w700,
-                        color: _C.ink,
-                      ),
-                    ),
-                    const SizedBox(height: 8),
-                    const Text(
-                      'Enter the invite code HR sent you and choose a new password.',
-                      textAlign: TextAlign.center,
-                      style: TextStyle(
-                        fontFamily: _font,
-                        fontSize: 14,
-                        color: _C.muted,
-                      ),
-                    ),
-                    const SizedBox(height: 28),
-                    if (_error != null) ...[
-                      _Banner(message: _error!),
-                      const SizedBox(height: 14),
-                    ],
-                    _Field(
-                      controller: _codeController,
-                      label: 'Invite code',
-                      enabled: !_loading,
-                      textCapitalization: TextCapitalization.characters,
-                      textInputAction: TextInputAction.next,
-                      inputFormatters: [
-                        FilteringTextInputFormatter.allow(
-                            RegExp(r'[A-Za-z0-9]')),
-                        _UpperCaseFormatter(),
-                        LengthLimitingTextInputFormatter(8),
-                      ],
-                      prefix: const HugeIcon(
-                        icon: HugeIcons.strokeRoundedKey01,
-                        color: _C.muted,
-                        size: 20,
-                      ),
-                    ),
-                    const SizedBox(height: 14),
-                    _Field(
-                      controller: _newController,
-                      label: 'New password',
-                      enabled: !_loading,
-                      obscureText: _obscureNew,
-                      textInputAction: TextInputAction.next,
-                      inputFormatters: [LengthLimitingTextInputFormatter(72)],
-                      prefix: const HugeIcon(
-                        icon: HugeIcons.strokeRoundedLockPassword,
-                        color: _C.muted,
-                        size: 20,
-                      ),
-                      suffix: _eye(_obscureNew,
-                              () => setState(() => _obscureNew = !_obscureNew)),
-                    ),
-                    const SizedBox(height: 14),
-                    _Field(
-                      controller: _confirmController,
-                      label: 'Confirm password',
-                      enabled: !_loading,
-                      obscureText: _obscureConfirm,
-                      textInputAction: TextInputAction.done,
-                      inputFormatters: [LengthLimitingTextInputFormatter(72)],
-                      onSubmitted: (_) => _submit(),
-                      prefix: const HugeIcon(
-                        icon: HugeIcons.strokeRoundedLockPassword,
-                        color: _C.muted,
-                        size: 20,
-                      ),
-                      suffix: _eye(
-                        _obscureConfirm,
-                            () =>
-                            setState(() => _obscureConfirm = !_obscureConfirm),
-                      ),
-                    ),
-                    const SizedBox(height: 16),
-                    _rule('At least 8 characters', _hasLength),
-                    _rule('Contains a letter', _hasLetter),
-                    _rule('Contains a number', _hasNumber),
-                    _rule('Not your temporary password', _notTemporary),
-                    _rule('Passwords match', _matches),
-                    const SizedBox(height: 24),
-                    _PrimaryButton(
-                      label: 'Update password',
-                      loading: _loading,
-                      onPressed: _canSubmit ? _submit : null,
-                    ),
-                    const SizedBox(height: 16),
-                    Center(
-                      child: GestureDetector(
-                        onTap: _signOut,
-                        behavior: HitTestBehavior.opaque,
-                        child: const Padding(
-                          padding: EdgeInsets.symmetric(vertical: 6),
-                          child: Row(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              HugeIcon(
-                                icon: HugeIcons.strokeRoundedLogout01,
-                                color: _C.muted,
-                                size: 16,
-                              ),
-                              SizedBox(width: 6),
-                              Text(
-                                'Sign out',
-                                style: TextStyle(
-                                  fontFamily: _font,
-                                  fontSize: 13,
-                                  fontWeight: FontWeight.w600,
-                                  color: _C.muted,
-                                ),
-                              ),
-                            ],
-                          ),
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
+                child: _success ? _buildSuccess() : _buildForm(),
               ),
             ),
           ),
         ),
       ),
+    );
+  }
+
+  Widget _buildSuccess() {
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        const _Logo(),
+        const SizedBox(height: 28),
+        Center(
+          child: Container(
+            width: 72,
+            height: 72,
+            decoration: const BoxDecoration(
+              color: _C.okBg,
+              shape: BoxShape.circle,
+            ),
+            alignment: Alignment.center,
+            child: const HugeIcon(
+              icon: HugeIcons.strokeRoundedCheckmarkCircle02,
+              color: _C.ok,
+              size: 40,
+            ),
+          ),
+        ),
+        const SizedBox(height: 20),
+        const Text(
+          'Password updated',
+          textAlign: TextAlign.center,
+          style: TextStyle(
+            fontFamily: _font,
+            fontSize: 26,
+            fontWeight: FontWeight.w700,
+            color: _C.ink,
+          ),
+        ),
+        const SizedBox(height: 8),
+        const Text(
+          'Your password was reset. Sign in with your new password.',
+          textAlign: TextAlign.center,
+          style: TextStyle(fontFamily: _font, fontSize: 14, color: _C.muted),
+        ),
+        const SizedBox(height: 28),
+        _PrimaryButton(label: 'Back to sign in', onPressed: _backToLogin),
+      ],
+    );
+  }
+
+  Widget _buildForm() {
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        const _Logo(),
+        const SizedBox(height: 28),
+        const Text(
+          'Reset password',
+          textAlign: TextAlign.center,
+          style: TextStyle(
+            fontFamily: _font,
+            fontSize: 28,
+            fontWeight: FontWeight.w700,
+            color: _C.ink,
+          ),
+        ),
+        const SizedBox(height: 8),
+        const Text(
+          'Enter the reset code HR gave you (valid for 30 minutes, one use) and choose a new password.',
+          textAlign: TextAlign.center,
+          style: TextStyle(fontFamily: _font, fontSize: 14, color: _C.muted),
+        ),
+        const SizedBox(height: 28),
+        if (_error != null) ...[
+          _Banner(message: _error!),
+          const SizedBox(height: 14),
+        ],
+        _Field(
+          controller: _emailController,
+          label: 'Email',
+          hint: 'you@company.com',
+          enabled: !_loading,
+          keyboardType: TextInputType.emailAddress,
+          textInputAction: TextInputAction.next,
+          inputFormatters: [FilteringTextInputFormatter.deny(RegExp(r'\s'))],
+          onSubmitted: (_) => _codeFocus.requestFocus(),
+          prefix: const HugeIcon(
+            icon: HugeIcons.strokeRoundedMail01,
+            color: _C.muted,
+            size: 20,
+          ),
+        ),
+        const SizedBox(height: 14),
+        _Field(
+          controller: _codeController,
+          focusNode: _codeFocus,
+          label: 'Reset code',
+          enabled: !_loading,
+          textCapitalization: TextCapitalization.characters,
+          textInputAction: TextInputAction.next,
+          inputFormatters: [
+            FilteringTextInputFormatter.allow(RegExp(r'[A-Za-z0-9]')),
+            _UpperCaseFormatter(),
+            LengthLimitingTextInputFormatter(32),
+          ],
+          onSubmitted: (_) => _newFocus.requestFocus(),
+          prefix: const HugeIcon(
+            icon: HugeIcons.strokeRoundedKey01,
+            color: _C.muted,
+            size: 20,
+          ),
+        ),
+        const SizedBox(height: 14),
+        _Field(
+          controller: _newController,
+          focusNode: _newFocus,
+          label: 'New password',
+          enabled: !_loading,
+          obscureText: _obscureNew,
+          textInputAction: TextInputAction.next,
+          inputFormatters: [LengthLimitingTextInputFormatter(128)],
+          onSubmitted: (_) => _confirmFocus.requestFocus(),
+          prefix: const HugeIcon(
+            icon: HugeIcons.strokeRoundedLockPassword,
+            color: _C.muted,
+            size: 20,
+          ),
+          suffix: _eye(_obscureNew, () => setState(() => _obscureNew = !_obscureNew)),
+        ),
+        const SizedBox(height: 14),
+        _Field(
+          controller: _confirmController,
+          focusNode: _confirmFocus,
+          label: 'Confirm password',
+          enabled: !_loading,
+          obscureText: _obscureConfirm,
+          textInputAction: TextInputAction.done,
+          inputFormatters: [LengthLimitingTextInputFormatter(128)],
+          onSubmitted: (_) => _submit(),
+          prefix: const HugeIcon(
+            icon: HugeIcons.strokeRoundedLockPassword,
+            color: _C.muted,
+            size: 20,
+          ),
+          suffix: _eye(
+            _obscureConfirm,
+                () => setState(() => _obscureConfirm = !_obscureConfirm),
+          ),
+        ),
+        const SizedBox(height: 16),
+        _rule('At least 12 characters', _hasLength),
+        _rule('Contains an uppercase letter', _hasUpper),
+        _rule('Contains a lowercase letter', _hasLower),
+        _rule('Contains a number', _hasNumber),
+        _rule('Passwords match', _matches),
+        const SizedBox(height: 24),
+        _PrimaryButton(
+          label: 'Reset password',
+          loading: _loading,
+          onPressed: _canSubmit ? _submit : null,
+        ),
+        const SizedBox(height: 16),
+        Center(
+          child: GestureDetector(
+            onTap: _loading ? null : _backToLogin,
+            behavior: HitTestBehavior.opaque,
+            child: const Padding(
+              padding: EdgeInsets.symmetric(vertical: 6, horizontal: 12),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  HugeIcon(
+                    icon: HugeIcons.strokeRoundedArrowLeft01,
+                    color: _C.muted,
+                    size: 16,
+                  ),
+                  SizedBox(width: 6),
+                  Text(
+                    'Back to sign in',
+                    style: TextStyle(
+                      fontFamily: _font,
+                      fontSize: 13,
+                      fontWeight: FontWeight.w600,
+                      color: _C.muted,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ],
     );
   }
 }
@@ -361,7 +422,7 @@ class _Logo extends StatelessWidget {
           height: 80,
           width: 80,
           decoration: BoxDecoration(
-            color: _C.primary.withOpacity(0.06),
+            color: _C.primary.withOpacity(0.08),
             borderRadius: BorderRadius.circular(20),
           ),
           alignment: Alignment.center,
@@ -427,8 +488,9 @@ class _Field extends StatelessWidget {
       textCapitalization: textCapitalization,
       inputFormatters: inputFormatters,
       onSubmitted: onSubmitted,
+      autocorrect: false,
+      enableSuggestions: false,
 
-      // Custom blinking cursor (instead of the default Flutter one)
       cursorColor: _C.primary,
       cursorWidth: 2.5,
       cursorHeight: 22,
@@ -475,7 +537,7 @@ class _Field extends StatelessWidget {
         suffixIcon: suffix,
         enabledBorder: _border(_C.border),
         disabledBorder: _border(_C.border),
-        focusedBorder: _border(_C.primary, 1.6),
+        focusedBorder: _border(_C.primary, 1.8),
         border: _border(_C.border),
       ),
     );
@@ -503,7 +565,6 @@ class _PrimaryButton extends StatelessWidget {
         onPressed: loading ? null : onPressed,
         style: ElevatedButton.styleFrom(
           backgroundColor: _C.primary,
-          // Solid black while loading, faded black when form is incomplete.
           disabledBackgroundColor:
           loading ? _C.primary : _C.primary.withOpacity(0.25),
           foregroundColor: Colors.white,
