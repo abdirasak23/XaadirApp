@@ -1,4 +1,4 @@
-package com.example.xaadir // <- change to your applicationId / package
+package com.horeeye.xaadir // <- change to your applicationId / package
 
 import android.content.pm.PackageManager
 import android.os.Build
