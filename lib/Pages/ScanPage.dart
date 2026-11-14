@@ -83,7 +83,7 @@ const Set<String> _selfieCodes = {'SELFIE_REQUIRED', 'SELFIE_INVALID'};
 // ════════════════════════════════════════════════════════════════════
 //  SCAN PAGE
 // ════════════════════════════════════════════════════════════════════
-enum _Phase { checking, biometric, selfie, blocked, camera, submitting, result }
+enum _Phase { checking, biometric, selfie, confirmEarly, blocked, camera, submitting, result }
 
 class ScanPage extends StatefulWidget {
   const ScanPage({super.key});
@@ -161,8 +161,6 @@ class _ScanPageState extends State<ScanPage>
     }
   }
 
-
-
   // ───────────── scanner helpers ─────────────
   MobileScannerController _newScanner() => MobileScannerController(
     detectionSpeed: DetectionSpeed.noDuplicates,
@@ -229,18 +227,16 @@ class _ScanPageState extends State<ScanPage>
         return;
       }
 
-      // Selfie staff: place is already verified → take the selfie BEFORE the QR camera opens.
-      if (ctx.method == CheckInMethod.selfie) {
-        setState(() => _ctx = ctx);
-        final ok = await _captureSelfie();
-        if (!mounted || id != _seq || !ok) return; // closed the camera → "Take your selfie" screen stays
+      // Leaving before the check-out window: show the confirmation screen first.
+      if (ctx.next == CheckinAction.checkOut && ctx.earlyMinutes > 0) {
+        setState(() {
+          _ctx = ctx;
+          _phase = _Phase.confirmEarly;
+        });
+        return;
       }
 
-      setState(() {
-        _ctx = ctx;
-        _scanner = _newScanner();
-        _phase = _Phase.camera;
-      });
+      await _proceed(ctx, id);
     } on TimeoutException {
       if (!mounted || id != _seq) return;
       _showBlocked(AuthFailure('NETWORK', 'The connection is too slow. Please try again.'));
@@ -257,6 +253,22 @@ class _ScanPageState extends State<ScanPage>
       if (!mounted || id != _seq) return;
       _showBlocked(AuthFailure('UNKNOWN', 'Something went wrong. Please try again.'));
     }
+  }
+
+  /// Selfie (if needed) → QR camera. Runs after preflight, or after "Yes, check out".
+  Future<void> _proceed(ScanContextInfo ctx, int id) async {
+    if (!mounted || id != _seq) return;
+    if (ctx.method == CheckInMethod.selfie) {
+      setState(() => _ctx = ctx);
+      final ok = await _captureSelfie();
+      if (!mounted || id != _seq || !ok) return; // closed the camera → "Take your selfie" screen stays
+    }
+    if (!mounted || id != _seq) return;
+    setState(() {
+      _ctx = ctx;
+      _scanner = _newScanner();
+      _phase = _Phase.camera;
+    });
   }
 
   /// Opens the selfie page. true = selfie saved in the service, false = person closed it.
@@ -427,6 +439,14 @@ class _ScanPageState extends State<ScanPage>
     return '$h12:${mm.toString().padLeft(2, '0')} ${h24 >= 12 ? 'PM' : 'AM'}';
   }
 
+  /// Duration like "2h 40m", "2h" or "35m".
+  static String _dur(int m) {
+    final h = m ~/ 60;
+    final mm = m % 60;
+    if (h == 0) return '${mm}m';
+    return mm == 0 ? '${h}h' : '${h}h ${mm}m';
+  }
+
   static String _shiftTitle(int? number, int total) =>
       (total > 1 && number != null) ? 'Shift $number of $total' : '';
 
@@ -460,6 +480,10 @@ class _ScanPageState extends State<ScanPage>
         return 'Just checked in';
       case 'TOO_EARLY':
         return 'Shift not started yet';
+      case 'CHECKIN_CLOSED':
+        return 'Check-in closed';
+      case 'NO_SHIFT_TODAY':
+        return 'No shift today';
       case 'ALREADY_CHECKED_OUT':
         return 'Already done for today';
       case 'MARKED_ABSENT':
@@ -507,6 +531,8 @@ class _ScanPageState extends State<ScanPage>
         return _I.qr;
       case 'TOO_SOON':
       case 'TOO_EARLY':
+      case 'CHECKIN_CLOSED':
+      case 'NO_SHIFT_TODAY':
         return _I.clock;
       default:
         return _I.alert;
@@ -524,6 +550,8 @@ class _ScanPageState extends State<ScanPage>
         return _C.red;
       case 'TOO_SOON':
       case 'TOO_EARLY':
+      case 'CHECKIN_CLOSED':
+      case 'NO_SHIFT_TODAY':
       case 'ALREADY_CHECKED_OUT':
         return _C.blue;
       default:
@@ -570,7 +598,14 @@ class _ScanPageState extends State<ScanPage>
       case 'QR_EXPIRED':
         return const ['Scan the live QR code shown at your branch'];
       case 'TOO_EARLY':
-        return const ['You can check in up to 60 minutes before a shift', 'Come back closer to the start time'];
+        return const ['You can check in from 20 minutes before your shift', 'Come back closer to the start time'];
+      case 'CHECKIN_CLOSED':
+        return const [
+          'Check-in is open until 60 minutes after your shift starts',
+          'Ask HR to record your attendance',
+        ];
+      case 'NO_SHIFT_TODAY':
+        return const ['Contact HR if you should be working today'];
       case 'NETWORK':
         return const ['Check your Wi-Fi or mobile data', 'Then try again'];
       case 'NO_BIOMETRIC_ENROLLED':
@@ -657,6 +692,9 @@ class _ScanPageState extends State<ScanPage>
           onTitleLongPress: _showDiagnostics,
         );
 
+      case _Phase.confirmEarly:
+        return _buildConfirmEarly();
+
       case _Phase.blocked:
         return _buildBlocked();
 
@@ -667,6 +705,91 @@ class _ScanPageState extends State<ScanPage>
       case _Phase.submitting:
         return _buildCamera();
     }
+  }
+
+  // ───────────── leaving early ─────────────
+  Widget _buildConfirmEarly() {
+    final ctx = _ctx;
+    final early = ctx?.earlyMinutes ?? 0;
+    final endMin = ctx?.shiftEndMin;
+    final now = DateTime.now();
+    final nowMin = now.hour * 60 + now.minute;
+    final shiftTitle = _shiftTitle(ctx?.shiftNumber, ctx?.shiftTotal ?? 1);
+
+    return _StatusView(
+      tone: _C.orange,
+      leading: const _PopIn(child: Icon(Icons.logout_rounded, color: _C.orange, size: 42)),
+      title: 'Leaving early?',
+      subtitle: shiftTitle.isEmpty ? 'Your shift is not finished yet.' : '$shiftTitle is not finished yet.',
+      body: Column(
+        children: [
+          Container(
+            height: 36,
+            padding: const EdgeInsets.symmetric(horizontal: 16),
+            alignment: Alignment.center,
+            decoration: BoxDecoration(
+              color: _tint(_C.orange, 0.12),
+              borderRadius: BorderRadius.circular(999),
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Container(
+                  width: 8,
+                  height: 8,
+                  decoration: const BoxDecoration(color: _C.orange, shape: BoxShape.circle),
+                ),
+                const SizedBox(width: 8),
+                Text(
+                  '${_dur(early)} early',
+                  style: const TextStyle(
+                      fontFamily: _T.f, fontSize: 13, fontWeight: FontWeight.w600, color: _C.orange),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 18),
+          Container(
+            width: double.infinity,
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+            decoration: BoxDecoration(color: _C.card, borderRadius: BorderRadius.circular(20)),
+            child: Column(
+              children: [
+                if (endMin != null) _earlyRow('Shift ends', _fmt(endMin)),
+                if (endMin != null) Container(height: 1, color: _C.border),
+                _earlyRow('Check-out now', _fmt(nowMin)),
+                Container(height: 1, color: _C.border),
+                _earlyRow('Recorded as', 'Left ${_dur(early)} early', color: _C.orange),
+              ],
+            ),
+          ),
+        ],
+      ),
+      tips: const ['Your early leave is saved on your attendance record'],
+      primaryLabel: 'Yes, check out',
+      onPrimary: () {
+        HapticFeedback.selectionClick();
+        final c = _ctx;
+        if (c != null) _proceed(c, _seq);
+      },
+      secondaryLabel: 'Stay at work',
+      onSecondary: () => _close(),
+      onClose: _close,
+      onTitleLongPress: _showDiagnostics,
+    );
+  }
+
+  Widget _earlyRow(String label, String value, {Color color = _C.ink}) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 12),
+      child: Row(
+        children: [
+          Expanded(child: Text(label, style: _T.body)),
+          const SizedBox(width: 12),
+          Text(value, style: _T.bodyStrong.copyWith(color: color)),
+        ],
+      ),
+    );
   }
 
   // ───────────── blocked ─────────────
@@ -740,6 +863,8 @@ class _ScanPageState extends State<ScanPage>
         break;
       case 'TOO_SOON':
       case 'TOO_EARLY':
+      case 'CHECKIN_CLOSED':
+      case 'NO_SHIFT_TODAY':
       case 'ALREADY_CHECKED_OUT':
       case 'MARKED_ABSENT':
         primaryLabel = 'Done';
@@ -813,11 +938,14 @@ class _ScanPageState extends State<ScanPage>
 
     final isIn = r.action == CheckinAction.checkIn;
     final late = r.status == 'late';
+    final early = !isIn && r.earlyMinutes > 0;
     final multi = r.isMultiShift;
-    final chipColor = isIn ? (late ? _C.orange : _C.green) : _C.ink;
+    final chipColor = isIn ? (late ? _C.orange : _C.green) : (early ? _C.orange : _C.ink);
     final chipText = isIn
         ? (late ? 'Late ${r.lateMinutes} min' : 'On time')
-        : (r.checkInMin != null ? 'In ${_fmt(r.checkInMin!)}' : 'Checked out');
+        : (early
+        ? 'Left ${_dur(r.earlyMinutes)} early'
+        : (r.checkInMin != null ? 'In ${_fmt(r.checkInMin!)}' : 'Checked out'));
 
     final shiftTitle = _shiftTitle(r.shiftNumber, r.shiftTotal);
     final shiftWindow = (r.shiftStartMin != null && r.shiftEndMin != null)
@@ -1202,7 +1330,7 @@ class _ScanPageState extends State<ScanPage>
 }
 
 // ════════════════════════════════════════════════════════════════════
-//  STATUS VIEW (checking / biometric / selfie / blocked / result / camera error)
+//  STATUS VIEW (checking / biometric / selfie / confirm / blocked / result / camera error)
 // ════════════════════════════════════════════════════════════════════
 class _StatusView extends StatelessWidget {
   const _StatusView({

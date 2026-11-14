@@ -9,6 +9,8 @@ import '../Auth/AuthService.dart';
 import '../Services/BiometrricService.dart';
 import '../Services/DataService.dart';
 import '../Services/ScanService.dart';
+import '../Services/UpdateDownloadService.dart';
+import '../Widgets/updateDownload.dart';
 import 'FingrPrintPage.dart';
 import 'ScanPage.dart';
 
@@ -430,6 +432,7 @@ class _HomeScreenState extends State<HomeScreen>
 
   BioGate _bio = BioGate.unknown;
   bool _autoPrompted = false;
+  bool _updateOpen = false;
   CheckInMethod? _method;
 
   // Month picker: null → the current month (default).
@@ -535,6 +538,7 @@ class _HomeScreenState extends State<HomeScreen>
         _offline = false;
       });
       unawaited(_refreshBio());
+      unawaited(_checkUpdate());
     } on AuthFailure catch (e) {
       if (!mounted || id != _seq) return;
       if (await HomeDataService.handleSessionFailure(e)) return;
@@ -555,6 +559,20 @@ class _HomeScreenState extends State<HomeScreen>
         _loading = false;
         if (_data == null) _error = 'Something went wrong. Please try again.';
       });
+    }
+  }
+
+  /// Shows the update popup when the database switch is ON.
+  /// Closable popup: once per app launch. After 3 closes: locked, shown every time.
+  Future<void> _checkUpdate() async {
+    if (_updateOpen || !mounted) return;
+    final info = await UpdateDownloadService.instance.check();
+    if (info == null || !mounted || _updateOpen) return;
+    _updateOpen = true;
+    try {
+      await showUpdateDownloadPopup(context, info);
+    } finally {
+      _updateOpen = false;
     }
   }
 
@@ -2981,6 +2999,7 @@ class _TopLogo extends StatelessWidget {
   }
 }
 
+
 // ════════════════════════════════════════════════════════════════════
 //  PROFILE BOTTOM SHEET (view only + logout)
 // ════════════════════════════════════════════════════════════════════
@@ -3068,15 +3087,45 @@ class ProfileSheet extends StatelessWidget {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Container(
-              width: 40,
-              height: 4,
-              decoration: BoxDecoration(
-                color: const Color(0xFFD1D5DB),
-                borderRadius: BorderRadius.circular(2),
+            // Drag handle (centered) + close button (top right)
+            SizedBox(
+              width: double.infinity,
+              height: 48,
+              child: Stack(
+                alignment: Alignment.center,
+                children: [
+                  Container(
+                    width: 40,
+                    height: 4,
+                    decoration: BoxDecoration(
+                      color: const Color(0xFFD1D5DB),
+                      borderRadius: BorderRadius.circular(2),
+                    ),
+                  ),
+                  Align(
+                    alignment: Alignment.centerRight,
+                    child: Semantics(
+                      button: true,
+                      label: 'Close',
+                      child: Material(
+                        color: XColors.card,
+                        shape: const CircleBorder(),
+                        child: InkWell(
+                          customBorder: const CircleBorder(),
+                          onTap: () => Navigator.of(context).maybePop(),
+                          child: const SizedBox(
+                            width: 48,
+                            height: 48,
+                            child: Center(child: _Hi(XIcons.close, size: 22)),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ],
               ),
             ),
-            const SizedBox(height: 20),
+            const SizedBox(height: 8),
             ValueListenableBuilder<_Snap>(
               valueListenable: source,
               builder: (context, snap, _) {
@@ -3247,7 +3296,6 @@ class ProfileSheet extends StatelessWidget {
     );
   }
 }
-
 /// Weekly schedule, Monday first, one row per day. Today is highlighted.
 class _WeekCard extends StatelessWidget {
   const _WeekCard({required this.data});

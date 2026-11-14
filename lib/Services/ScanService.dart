@@ -59,6 +59,7 @@ class ScanContextInfo {
     this.shiftStartMin,
     this.shiftEndMin,
     this.shiftsDone = 0,
+    this.earlyMinutes = 0,
   });
 
   final CheckinAction next;
@@ -71,6 +72,9 @@ class ScanContextInfo {
   final int? shiftStartMin;
   final int? shiftEndMin;
   final int shiftsDone;
+
+  /// Minutes the person is leaving before the shift end (0 = not early). Only for check-out.
+  final int earlyMinutes;
 
   bool get isMultiShift => shiftTotal > 1;
 }
@@ -97,6 +101,7 @@ class CheckinResult {
     this.shiftStartMin,
     this.shiftEndMin,
     this.shiftsDone = 0,
+    this.earlyMinutes = 0,
   });
 
   final CheckinAction action;
@@ -111,6 +116,7 @@ class CheckinResult {
   final int? shiftStartMin;
   final int? shiftEndMin;
   final int shiftsDone;
+  final int earlyMinutes;
 
   bool get isMultiShift => shiftTotal > 1;
 }
@@ -506,9 +512,10 @@ class ScanService {
       shiftStartMin: _int(json['shift_start_min']),
       shiftEndMin: _int(json['shift_end_min']),
       shiftsDone: _int(json['shifts_done']) ?? 0,
+      earlyMinutes: _int(json['early_minutes']) ?? 0,
     );
     debugPrint('🚦✅ Preflight OK → method=${method.name} next=$next shift=${ctx.shiftNumber}/${ctx.shiftTotal} '
-        'branch=${ctx.branchName} dist=${ctx.distanceM}m/${ctx.radiusM}m');
+        'branch=${ctx.branchName} dist=${ctx.distanceM}m/${ctx.radiusM}m early=${ctx.earlyMinutes}m');
 
     // Place is fine. Biometric staff prove it is them NOW, before the camera opens.
     if (next != CheckinAction.done && method == CheckInMethod.biometric) {
@@ -599,10 +606,11 @@ class ScanService {
       shiftStartMin: _int(json['shift_start_min']),
       shiftEndMin: _int(json['shift_end_min']),
       shiftsDone: _int(json['shifts_done']) ?? 0,
+      earlyMinutes: _int(json['early_minutes']) ?? 0,
     );
 
     debugPrint('✅ Scan recorded → ${result.action} shift ${result.shiftNumber}/${result.shiftTotal} '
-        'at ${result.timeMin} min, status=${result.status}');
+        'at ${result.timeMin} min, status=${result.status}, early=${result.earlyMinutes}m');
     return result;
   }
 }
