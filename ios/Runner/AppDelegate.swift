@@ -20,6 +20,7 @@ import Security
 /// Face ID / Touch ID bound signing key (Secure Enclave, P-256).
 ///  - biometryCurrentSet: adding or changing a face/finger kills the key (NOT biometryAny)
 ///  - NO devicePasscode flag, fallback button hidden: no PIN fallback anywhere
+///  - The signing call itself shows the Face ID prompt (no separate evaluatePolicy step)
 final class XaadirBiometric {
   static let shared = XaadirBiometric()
 
@@ -27,8 +28,7 @@ final class XaadirBiometric {
   private var busy = false
   private var channel: FlutterMethodChannel?
 
-  // ASN.1 header that turns a raw P-256 point (65 bytes) into X.509 SubjectPublicKeyInfo,
-  // which is what the Edge Functions import with WebCrypto "spki".
+  // ASN.1 header: raw P-256 point (65 bytes) -> X.509 SubjectPublicKeyInfo (server uses WebCrypto "spki").
   private let spkiHeader: [UInt8] = [
     0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01,
     0x06, 0x08, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07, 0x03, 0x42, 0x00,
@@ -97,7 +97,6 @@ final class XaadirBiometric {
       "reason": reason,
       "type": type,
       "keyExists": exists,
-      // iOS removes the key itself when the enrolled set changes, so "exists" == "valid".
       "keyValid": exists,
     ]
   }
@@ -176,17 +175,20 @@ final class XaadirBiometric {
     result(spki.base64EncodedString())
   }
 
-  // ───────────── signing behind Face ID / Touch ID ─────────────
+  // ───────────── error mapping ─────────────
   private func mapLA(_ error: NSError?) -> String {
-    guard let e = error, let code = LAError.Code(rawValue: e.code) else { return "AUTH_ERROR" }
+    guard let e = error, e.domain == LAError.errorDomain,
+          let code = LAError.Code(rawValue: e.code) else { return "AUTH_ERROR" }
     switch code {
     case .userCancel, .systemCancel, .appCancel, .userFallback: return "CANCELLED"
     case .biometryLockout: return "LOCKED_OUT"
     case .biometryNotEnrolled, .passcodeNotSet: return "NONE_ENROLLED"
+    case .authenticationFailed: return "AUTH_FAILED"
     default: return "AUTH_ERROR"
     }
   }
 
+  // ───────────── signing: the signature call itself shows Face ID / Touch ID ─────────────
   private func sign(payload: String?, reason: String, _ result: @escaping FlutterResult) {
     guard let payload = payload, !payload.isEmpty else {
       result(FlutterError(code: "INVALID_PAYLOAD", message: "Nothing to sign", details: nil))
@@ -197,47 +199,62 @@ final class XaadirBiometric {
       return
     }
     if !keyExists() {
-      // iOS deletes the key when a face/finger is added or removed.
-      result(FlutterError(code: "KEY_INVALIDATED", message: "Biometrics changed", details: nil))
-      return
-    }
-
-    let ctx = LAContext()
-    ctx.localizedFallbackTitle = ""   // hides "Enter Passcode": no PIN fallback
-    ctx.localizedCancelTitle = "Cancel"
-
-    var err: NSError?
-    guard ctx.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: &err) else {
-      result(FlutterError(code: mapLA(err), message: err?.localizedDescription, details: nil))
+      result(FlutterError(code: "KEY_INVALIDATED", message: "Biometrics changed", details: "no key"))
       return
     }
 
     busy = true
-    ctx.evaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, localizedReason: reason) { [weak self] ok, error in
-      DispatchQueue.main.async {
-        guard let self = self else { return }
-        self.busy = false
-        if !ok {
-          result(FlutterError(code: self.mapLA(error as NSError?), message: error?.localizedDescription, details: nil))
-          return
+
+    let ctx = LAContext()
+    ctx.localizedFallbackTitle = ""        // hides "Enter Passcode": no PIN fallback
+    ctx.localizedCancelTitle = "Cancel"
+    ctx.localizedReason = reason           // text shown with the Face ID / Touch ID prompt
+
+    // Blocks while the system biometric UI is up, so never on the main thread.
+    DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+      guard let self = self else { return }
+
+      func finish(_ value: Any) {
+        DispatchQueue.main.async {
+          self.busy = false
+          result(value)
         }
-        // Authenticated context unlocks the Secure Enclave key for this one signature.
-        guard let key = self.loadKey(context: ctx) else {
-          result(FlutterError(code: "KEY_INVALIDATED", message: "Biometrics changed", details: nil))
-          return
-        }
-        var cfErr: Unmanaged<CFError>?
-        guard let sig = SecKeyCreateSignature(
-          key,
-          .ecdsaSignatureMessageX962SHA256,
-          Data(payload.utf8) as CFData,
-          &cfErr
-        ) as Data? else {
-          result(FlutterError(code: "SIGN_FAILED", message: "Signing failed", details: nil))
-          return
-        }
-        result(sig.base64EncodedString()) // DER, which the server already converts
       }
+
+      guard let key = self.loadKey(context: ctx) else {
+        finish(FlutterError(code: "KEY_INVALIDATED", message: "Biometrics changed", details: "load nil"))
+        return
+      }
+
+      var cfErr: Unmanaged<CFError>?
+      if let raw = SecKeyCreateSignature(
+        key,
+        .ecdsaSignatureMessageX962SHA256,
+        Data(payload.utf8) as CFData,
+        &cfErr
+      ) {
+        finish((raw as Data).base64EncodedString()) // DER, which the server converts
+        return
+      }
+
+      let ns: NSError? = cfErr.map { ($0.takeRetainedValue() as Error) as NSError }
+      let domain = ns?.domain ?? ""
+      let status = ns?.code ?? 0
+      let detail = "\(domain) \(status)"
+
+      let code: String
+      if domain == LAError.errorDomain {
+        code = self.mapLA(ns)                       // cancel / lockout / face not recognised
+      } else {
+        switch status {
+        case -128: code = "CANCELLED"               // errSecUserCanceled
+        case -25293: code = "SIGN_AUTH"             // errSecAuthFailed
+        case -25300: code = "KEY_INVALIDATED"       // errSecItemNotFound
+        case -25308: code = "AUTH_ERROR"            // errSecInteractionNotAllowed
+        default: code = "SIGN_FAILED"
+        }
+      }
+      finish(FlutterError(code: code, message: ns?.localizedDescription ?? "Signing failed", details: detail))
     }
   }
 }

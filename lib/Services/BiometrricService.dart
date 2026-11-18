@@ -2,6 +2,7 @@
 import 'dart:io' show Platform;
 import 'dart:ui' show PlatformDispatcher;
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 
 import '../Auth/AuthService.dart';
@@ -43,7 +44,6 @@ class BioText {
       ? 'Ku dhis faraha (Android) ama Face ID / Touch ID (iPhone) dejinta taleefankaaga, kadibna mar kale isku day.'
       : 'Set up a fingerprint (Android) or Face ID / Touch ID (iPhone) in your phone settings, then try again.';
 
-  /// Short name: "Face ID", "Touch ID", "Fingerprint", "Face unlock".
   static String name(String type) {
     if (type == 'face') return Platform.isIOS ? 'Face ID' : 'Face unlock';
     return Platform.isIOS ? 'Touch ID' : 'Fingerprint';
@@ -91,6 +91,9 @@ class BiometricService {
 
   AuthService get _auth => AuthService.instance;
 
+  /// Last raw error from the phone (shown in diagnostics and appended to the error message).
+  String? lastNativeError;
+
   // ───────────── local phone state ─────────────
   Future<BioStatus> localStatus() async {
     try {
@@ -122,7 +125,6 @@ class BiometricService {
     return j['biometric_status']?.toString() ?? 'none';
   }
 
-  /// One answer for the UI: can this staff member check in right now?
   Future<BioGate> gate() async {
     final local = await localStatus();
     final server = await serverStatus();
@@ -134,7 +136,6 @@ class BiometricService {
   }
 
   // ───────────── enrollment ─────────────
-  /// Creates the key pair, proves possession behind the biometric prompt, registers the public key.
   Future<void> enroll() async {
     final local = await localStatus();
     if (!local.available) throw _noBiometric();
@@ -185,8 +186,6 @@ class BiometricService {
     final local = await localStatus();
     if (!local.available) throw _noBiometric();
 
-    // The server already accepted this phone as "active" before we got here,
-    // so a missing / dead key means the enrolled biometrics changed (or the app was reinstalled).
     if (!local.keyExists || !local.keyValid) {
       await _reportInvalidated();
       throw _changed();
@@ -209,7 +208,7 @@ class BiometricService {
     return _Challenge(id, value);
   }
 
-  Future<String> _sign(String payload, String subtitle) async {
+  Future<String> _sign(String payload, String subtitle, {int attempt = 0}) async {
     try {
       final s = await _ch.invokeMethod<String>('sign', {
         'payload': payload,
@@ -219,12 +218,42 @@ class BiometricService {
       if (s == null || s.isEmpty) {
         throw AuthFailure('BIOMETRIC_FAILED', 'Could not confirm it is you. Try again.');
       }
+      lastNativeError = null;
       return s;
     } on PlatformException catch (e) {
+      final detail = '${e.code}${e.details != null ? ' ${e.details}' : ''}';
+      lastNativeError = detail;
+      debugPrint('🔐❌ Native sign error (attempt $attempt) → $detail');
+
       switch (e.code) {
         case 'KEY_INVALIDATED':
           await _reportInvalidated();
           throw _changed();
+
+        case 'BUSY':
+          if (attempt < 1) {
+            await Future<void>.delayed(const Duration(milliseconds: 700));
+            return _sign(payload, subtitle, attempt: attempt + 1);
+          }
+          throw AuthFailure('BIOMETRIC_FAILED', 'Another check is still open. Close it and try again.');
+
+        case 'SIGN_AUTH':
+        case 'SIGN_FAILED':
+        case 'AUTH_ERROR':
+        // One silent retry, then show the real code. Never mark the phone "changed" from here:
+        // a wrong guess would force HR re-approval for the user.
+          if (attempt < 1) {
+            await Future<void>.delayed(const Duration(milliseconds: 300));
+            return _sign(payload, subtitle, attempt: attempt + 1);
+          }
+          throw AuthFailure(
+            'BIOMETRIC_FAILED',
+            'Could not confirm it is you. If you changed your Face ID or fingerprint after registering, '
+                'ask HR to approve re-enrollment. [$detail]',
+          );
+
+        case 'AUTH_FAILED':
+          throw AuthFailure('BIOMETRIC_FAILED', 'Face or fingerprint not recognised. Try again.');
         case 'NO_KEY':
           throw AuthFailure('BIOMETRIC_REQUIRED', 'Register your biometric to check in.');
         case 'NONE_ENROLLED':
@@ -237,7 +266,7 @@ class BiometricService {
             'Too many wrong attempts. Wait a moment (or unlock your phone once), then try again.',
           );
         default:
-          throw AuthFailure('BIOMETRIC_FAILED', 'Could not confirm it is you. Try again.');
+          throw AuthFailure('BIOMETRIC_FAILED', 'Could not confirm it is you. Try again. [$detail]');
       }
     }
   }
